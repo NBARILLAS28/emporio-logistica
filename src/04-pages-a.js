@@ -39,9 +39,11 @@ PAGES.dashboard = {
     const maxCov = Math.max(1, (cfg().diasObjetivo || 14) * 2);
     const usoRows = tieneUso.map(r => {
       const lf = lotsOf(r.it.id), pct = Math.min(100, r.st.cov / maxCov * 100), cl = r.st.cov < (cfg().diasReposicion || 7) ? 'bad' : r.st.cov < (cfg().diasObjetivo || 14) ? 'warn' : '';
-      return `<tr><td>${esc(r.it.nombre)}</td><td class="r">${fmtQty(r.st.st)}</td><td class="r">${fmtN(r.st.u.perDay, 1)}</td><td style="min-width:130px"><div class="row" style="gap:8px;flex-wrap:nowrap"><div class="bar ${cl}" style="flex:1"><i style="width:${pct}%"></i></div><b class="num" style="min-width:34px;text-align:right">${fmtN(r.st.cov, 1)}</b></div></td><td>${fmtDate(r.st.agot)}</td><td class="r">${lf.avgLife ? fmtN(lf.avgLife, 0) : '—'}</td></tr>`;
+      return `<tr><td>${esc(r.it.nombre)}</td><td class="r">${fmtQty(r.st.st)}</td><td class="r">${fmtN(r.st.u.perDay, r.st.u.perDay < 1 ? 2 : 1)}</td><td style="min-width:130px"><div class="row" style="gap:8px;flex-wrap:nowrap"><div class="bar ${cl}" style="flex:1"><i style="width:${pct}%"></i></div><b class="num" style="min-width:34px;text-align:right">${fmtN(r.st.cov, 1)}</b></div></td><td>${fmtDate(r.st.agot)}</td><td class="r">${lf.avgLife ? fmtN(lf.avgLife, 0) : '—'}</td><td class="r">${(() => { const a = unitCycles(r.it.id).avg; return a !== null ? fmtN(a, 1) : '—'; })()}</td></tr>`;
     }).join('');
-    const alertRows = alerts.slice(0, 9).map(r => `<tr><td>${esc(r.it.nombre)} <small class="mut">${r.it.tipo === 'insumo' ? '· insumo' : ''}</small></td><td class="r">${fmtQty(r.st.st)}</td><td class="r">${r.st.min || '—'}</td><td>${statusChip(r.st)}</td><td class="r"><b>${fmtQty(suggestQty(r.it, r.st))}</b></td></tr>`).join('');
+    const alertRows = alerts.slice(0, 9).map(r => `<tr><td>${esc(r.it.nombre)} <small class="mut">${r.it.tipo === 'insumo' ? '· insumo' : ''}</small></td><td class="r">${fmtQty(r.st.st)}</td><td class="r">${r.st.min || '—'}</td><td>${statusChip(r.st)}${r.st.camino ? ` <small class="chip info">+${fmtQty(r.st.camino)} en camino</small>` : ''}</td><td class="r"><b>${fmtQty(suggestQty(r.it, r.st))}</b></td></tr>`).join('');
+    const pend = pendingRequests(), lt = leadTimes();
+    const pendHTML = pend.length ? `<div class="card"><h3>Solicitudes en espera <small>${pend.length} sin recibir completas${lt.med !== null ? ` · entrega típica: ${fmtN(lt.med, 0)} días` : ''}</small><button class="btn sm" data-act="go" data-page="solicitudes">Ver solicitudes</button></h3><div class="tw"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Para</th><th class="r">Pendientes</th><th class="r">Espera</th></tr></thead><tbody>${pend.slice(0, 6).map(p => `<tr><td><b>${esc(p.r.folio)}</b></td><td>${fmtDate(p.r.fecha)}</td><td>${esc(p.r.destNombre || (p.r.tipo === 'insumo' ? 'Insumos' : 'Productos'))}</td><td class="r">${p.pend} art.</td><td class="r">${p.tarde ? chip(p.dias + ' d · tarde', 'bad') : chip(p.dias + ' d', 'info')}</td></tr>`).join('')}</tbody></table></div></div>` : '';
     const nProd = alerts.filter(r => r.it.tipo === 'producto').length, nIns = alerts.filter(r => r.it.tipo === 'insumo').length;
     const venc = []; items.forEach(it => lotsOf(it.id).lots.forEach(l => { if (l.rest > 0 && l.vence && l.vence <= addDays(today(), 30)) venc.push({ it, l }); })); venc.sort((a, b) => a.l.vence.localeCompare(b.l.vence));
     const vencHTML = venc.length ? `<h3 class="mt">Por vencer <small>próximos 30 días</small></h3><div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Quedan</th><th>Vence</th></tr></thead><tbody>${venc.slice(0, 6).map(v => `<tr><td>${esc(v.it.nombre)}</td><td class="r">${fmtQty(v.l.rest)}</td><td>${fmtDate(v.l.vence)} ${v.l.vence < today() ? chip('Vencido', 'bad') : chip(daysBetween(today(), v.l.vence) + ' d', 'warn')}</td></tr>`).join('')}</tbody></table></div>` : '';
@@ -52,8 +54,9 @@ PAGES.dashboard = {
      <div class="cols3"><div class="card"><h3>Mayor salida en el periodo <small>unidades</small></h3><div class="chartbox sm"><canvas id="ch-top"></canvas></div></div>
        <div class="card"><h3>Alertas de reposición ${can('solicitud') && alerts.length ? `<span class="row" style="gap:6px">${nProd ? `<button class="btn sm pri" data-act="reqAlerts" data-t="producto">${ic('send')} Solicitar productos (${nProd})</button>` : ''}${nIns ? `<button class="btn sm pri" data-act="reqAlerts" data-t="insumo">${ic('send')} Solicitar insumos (${nIns})</button>` : ''}</span>` : ''}</h3>
        ${alertRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Exist.</th><th class="r">Mín.</th><th>Estado</th><th class="r">Sugerido</th></tr></thead><tbody>${alertRows}</tbody></table></div>${alerts.length > 9 ? `<small class="mut">+${alerts.length - 9} más en el reporte «Pedido sugerido»</small>` : ''}` : '<div class="empty"><b>Todo en orden</b>No hay artículos por reponer.</div>'}${vencHTML}</div></div>
+     ${pendHTML}
      <div class="card"><h3>Tiempo de uso y cobertura <small>según el consumo de los últimos ${cfg().ventanaConsumo} días</small><button class="btn sm" data-act="go" data-page="reportes" data-rep="consumo">Ver reporte completo</button></h3>
-       ${usoRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Consumo/día</th><th>Cobertura (días)</th><th>Se agota aprox.</th><th class="r" title="Días promedio que tarda en agotarse cada ingreso (método PEPS)">Vida prom. de lote (días)</th></tr></thead><tbody>${usoRows}</tbody></table></div>` : '<div class="empty">Aún no hay consumo suficiente para estimar la duración.</div>'}</div>`;
+       ${usoRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Consumo/día</th><th>Cobertura (días)</th><th>Se agota aprox.</th><th class="r" title="Días promedio que tarda en agotarse cada ingreso (método PEPS)">Vida prom. de lote (días)</th><th class="r" title="Días promedio entre abrir y terminar una unidad">Duración de 1 unidad (días)</th></tr></thead><tbody>${usoRows}</tbody></table></div>` : '<div class="empty">Aún no hay consumo suficiente para estimar la duración.</div>'}</div>`;
   },
   mount() {
     if (!window.Chart || !ix().items.length) return; chartDefaults();
@@ -90,22 +93,26 @@ function invRows() {
 }
 function invDS() {
   const costos = can('costos');
-  const cols = [{ t: 'Código', k: r => r.it.codigo || '' }, { t: 'Artículo', k: r => r.it.nombre }, { t: 'Categoría', k: r => catName(r.it.catId) }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Existencia', k: r => r.st.st, n: 1, d: 0 },
-  { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Estado', k: r => r.st.est }];
+  const ins = S.invTab === 'insumo';
+  const cols = [{ t: 'Código', k: r => r.it.codigo || '' }, { t: 'Artículo', k: r => r.it.nombre }, { t: ins ? 'Área' : 'Categoría', k: r => catName(r.it.catId) }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Existencia', k: r => r.st.st, n: 1, d: 0 },
+  ...(ins ? [{ t: 'Sellado', k: r => unitState(r.it.id).sellado, n: 1 }, { t: 'En uso', k: r => unitState(r.it.id).uso, n: 1 }, { t: 'En camino', k: r => r.st.camino || '', n: 1 }] : []),
+  { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 2 }, { t: 'Origen del consumo', k: r => r.st.u.origen }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, ...(ins ? [{ t: 'Duración de 1 unidad (días)', k: r => unitCycles(r.it.id).avg ?? '', n: 1, d: 1 }] : []), { t: 'Estado', k: r => r.st.est }];
   if (costos) cols.push({ t: 'Costo', k: r => r.it.costo, n: 1, d: 2 }, { t: 'Precio', k: r => r.it.precio, n: 1, d: 2 }, { t: 'Valor al costo', k: r => Math.max(0, r.st.st) * r.it.costo, n: 1, d: 2 });
   const rows = invRows();
   return { title: S.invTab === 'producto' ? 'Inventario de productos para venta' : 'Inventario de insumos', sub: 'Existencias al ' + fmtDate(today()) + ' · ' + rows.length + ' artículos', cols, rows, foot: { 'Artículo': 'TOTAL', 'Existencia': rows.reduce((a, r) => a + r.st.st, 0), ...(costos ? { 'Valor al costo': rows.reduce((a, r) => a + Math.max(0, r.st.st) * r.it.costo, 0) } : {}) } };
 }
 EXPSRC.inv = invDS;
 function invTable() {
-  const rows = invRows(), costos = can('costos');
+  const rows = invRows(), costos = can('costos'), ins = S.invTab === 'insumo';
   if (!rows.length) return `<div class="empty"><b>Sin artículos</b>${S.invQ || S.invCat || S.invEst ? 'Prueba quitando los filtros.' : (can('catalogo') ? 'Pulsa «Nuevo artículo» para crear el primero.' : '')}</div>`;
-  const body = rows.map(({ it, st }) => `<tr${it.activo === false ? ' style="opacity:.5"' : ''}><td>${esc(it.codigo || '')}</td><td><b>${esc(it.nombre)}</b>${it.activo === false ? ' <small>(archivado)</small>' : ''}<br><small class="mut">${esc(catName(it.catId))}${it.ubicacion ? ' · ' + esc(it.ubicacion) : ''}</small></td>
-    <td class="r"><b>${fmtQty(st.st)}</b> <small class="mut">${esc(it.unidad)}</small></td><td class="r">${st.min || '—'}${it.min > 0 ? '' : st.min ? ' <small class="mut" title="Mínimo calculado según consumo">auto</small>' : ''}</td>
-    <td class="r">${fmtN(st.u.perDay, 1)}</td><td class="r">${st.cov === null ? '—' : fmtN(st.cov, 1) + ' d'}</td><td>${statusChip(st)}</td>
+  const origen = u => u.origen === 'estimado' ? ' <small class="mut" title="Estimado inicial: se reemplaza automáticamente con el consumo real">est.</small>' : u.origen === 'mixto' ? ' <small class="mut" title="Mezcla de estimado inicial y consumo real">mix</small>' : '';
+  const body = rows.map(({ it, st }) => { const un = ins ? unitState(it.id) : null; return `<tr${it.activo === false ? ' style="opacity:.5"' : ''}><td>${esc(it.codigo || '')}</td><td><b>${esc(it.nombre)}</b>${it.activo === false ? ' <small>(archivado)</small>' : ''}<br><small class="mut">${esc(catName(it.catId))}${it.ubicacion ? ' · ' + esc(it.ubicacion) : ''}</small></td>
+    <td class="r"><b>${fmtQty(st.st)}</b> <small class="mut">${esc(it.unidad)}</small>${st.camino ? `<br><small class="chip info" title="Solicitado y aún sin recibir">+${fmtQty(st.camino)} en camino</small>` : ''}</td>
+    ${ins ? `<td class="r">${fmtQty(un.sellado)}</td><td class="r">${fmtQty(un.uso)}</td>` : ''}<td class="r">${st.min || '—'}${it.min > 0 ? '' : st.min ? ' <small class="mut" title="Mínimo calculado según consumo">auto</small>' : ''}</td>
+    <td class="r">${fmtN(st.u.perDay, st.u.perDay < 1 ? 2 : 1)}${origen(st.u)}</td><td class="r">${st.cov === null ? '—' : fmtN(st.cov, 1) + ' d'}</td><td>${statusChip(st)}</td>
     ${costos ? `<td class="r">${it.costo ? fmtN(it.costo, 2) : '—'}</td>${S.invTab === 'producto' ? `<td class="r">${it.precio ? fmtN(it.precio, 2) : '—'}</td>` : ''}<td class="r">${it.costo ? fmtN(Math.max(0, st.st) * it.costo, 2) : '—'}</td>` : ''}
-    <td><div class="act">${can('mov') ? `<button class="btn sm icon-btn" title="Registrar ingreso" data-act="movFor" data-id="${it.id}" data-d="in">${ic('plus')}</button><button class="btn sm icon-btn" title="Registrar egreso" data-act="movFor" data-id="${it.id}" data-d="out" style="font-weight:900">−</button>` : ''}<button class="btn sm icon-btn" title="Historial y tiempo de uso" data-act="kardex" data-id="${it.id}">${ic('clock')}</button>${can('catalogo') ? `<button class="btn sm icon-btn" title="Editar" data-act="editItem" data-id="${it.id}">${ic('edit')}</button>` : ''}</div></td></tr>`).join('');
-  return `<div class="tw"><table><thead><tr><th>Código</th><th>Artículo</th><th class="r">Existencia</th><th class="r">Mínimo</th><th class="r">Consumo/día</th><th class="r">Cobertura</th><th>Estado</th>${costos ? `<th class="r">Costo</th>${S.invTab === 'producto' ? '<th class="r">Precio</th>' : ''}<th class="r">Valor</th>` : ''}<th></th></tr></thead><tbody>${body}</tbody></table></div>`;
+    <td><div class="act">${can('mov') ? `<button class="btn sm icon-btn" title="Registrar ingreso" data-act="movFor" data-id="${it.id}" data-d="in">${ic('plus')}</button>${ins ? `<button class="btn sm" title="Pasar una unidad de Sellado a En uso" data-act="unitOpen" data-id="${it.id}">Abrir</button><button class="btn sm" title="Dar una unidad por terminada (sale del inventario)" data-act="unitDone" data-id="${it.id}">Terminar</button>` : ''}<button class="btn sm icon-btn" title="Registrar egreso" data-act="movFor" data-id="${it.id}" data-d="out" style="font-weight:900">−</button>` : ''}<button class="btn sm icon-btn" title="Historial y tiempo de uso" data-act="kardex" data-id="${it.id}">${ic('clock')}</button>${can('catalogo') ? `<button class="btn sm icon-btn" title="Editar" data-act="editItem" data-id="${it.id}">${ic('edit')}</button>` : ''}</div></td></tr>`; }).join('');
+  return `<div class="tw"><table><thead><tr><th>Código</th><th>Artículo</th><th class="r">Existencia</th>${ins ? '<th class="r" title="Unidades nuevas, sin abrir">Sellado</th><th class="r" title="Unidades abiertas, en uso">En uso</th>' : ''}<th class="r">Mínimo</th><th class="r">Consumo/día</th><th class="r">Cobertura</th><th>Estado</th>${costos ? `<th class="r">Costo</th>${S.invTab === 'producto' ? '<th class="r">Precio</th>' : ''}<th class="r">Valor</th>` : ''}<th></th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 PAGES.inventario = {
   title: 'Inventario',
@@ -129,7 +136,7 @@ ACT.newItem = () => openItem();
 ACT.editItem = el => openItem(el.dataset.id);
 
 function openItem(id) {
-  const it = id ? itemById(id) : { tipo: S.invTab, nombre: '', codigo: '', catId: '', unidad: 'unidad', pack: 0, min: 0, max: 0, costo: 0, precio: 0, provId: '', ubicacion: '', nota: '', duracionEsp: 0, activo: true };
+  const it = id ? itemById(id) : { tipo: S.invTab, nombre: '', codigo: '', catId: '', unidad: 'unidad', uCompra: '', pack: 0, min: 0, max: 0, costo: 0, precio: 0, provId: '', ubicacion: '', nota: '', duracionEsp: 0, baseDia: 0, activo: true };
   const costos = can('costos');
   openModal({
     title: id ? 'Editar artículo' : 'Nuevo artículo', size: 'mid',
@@ -146,6 +153,9 @@ function openItem(id) {
      <div class="grid g4">${costos ? `<div class="fld"><label>Costo unitario (${cfg().moneda})</label><input name="costo" type="number" min="0" step="any" value="${it.costo || ''}"></div><div class="fld only-prod"><label>Precio de venta (${cfg().moneda})</label><input name="precio" type="number" min="0" step="any" value="${it.precio || ''}"></div>` : ''}
       <div class="fld"><label>Proveedor habitual</label><select name="provId">${provOptions(it.provId)}</select></div>
       <div class="fld"><label>Ubicación</label><input name="ubicacion" value="${esc(it.ubicacion)}" placeholder="Bodega, recepción…"></div></div>
+     <div class="grid g3 only-ins"><div class="fld"><label>Se compra en (presentación)</label><input name="uCompra" value="${esc(it.uCompra || '')}" placeholder="Ej. tira de 50, caja, galón"></div>
+      <div class="fld"><label>Consumo mensual inicial (estimado)</label><input name="baseMes" type="number" min="0" step="any" value="${it.baseDia ? Math.round(it.baseDia * 30 * 10) / 10 : ''}" placeholder="Opcional"></div>
+      <div class="fld"><label>&nbsp;</label><small class="mut">Solo arranca el cálculo: el programa lo reemplaza solo con el consumo real que se vaya registrando.</small></div></div>
      <div class="grid g2"><div class="fld only-ins"><label>Duración esperada de 1 unidad (días)</label><input name="duracionEsp" type="number" min="0" step="any" value="${it.duracionEsp || ''}" placeholder="Opcional: para comparar con el uso real"></div>
       <div class="fld"><label>Notas</label><input name="nota" value="${esc(it.nota)}"></div></div>
      ${id ? `<label style="display:flex;gap:8px;align-items:center;font-weight:500"><input type="checkbox" name="activo" style="width:auto" ${it.activo !== false ? 'checked' : ''}> Artículo activo (desmarca para archivarlo)</label>`
@@ -161,10 +171,12 @@ SUB.item = async f => {
   const tipo = old ? old.tipo : g('tipo');
   if (ix().items.some(i => i.id !== id && i.tipo === tipo && norm(i.nombre) === norm(nombre))) return toast('Ya existe un artículo con ese nombre', 'bad');
   let catId = g('catId'); if (g('catNueva').trim()) catId = ensureCategory(g('catNueva').trim(), tipo);
-  const rec = { ...(old || { id: uid(), activo: true }), tipo, nombre, codigo: g('codigo').trim(), catId, unidad: g('unidad').trim() || 'unidad', pack: num(g('pack')), min: num(g('min')), max: num(g('max')), provId: g('provId'), ubicacion: g('ubicacion').trim(), nota: g('nota').trim(), duracionEsp: num(g('duracionEsp')) };
+  const rec = { ...(old || { id: uid(), activo: true }), tipo, nombre, codigo: g('codigo').trim(), catId, unidad: g('unidad').trim() || 'unidad', pack: num(g('pack')), min: num(g('min')), max: num(g('max')), provId: g('provId'), ubicacion: g('ubicacion').trim(), nota: g('nota').trim(), duracionEsp: num(g('duracionEsp')), uCompra: g('uCompra').trim(), baseDia: tipo === 'insumo' ? num(g('baseMes')) / 30 : 0 };
+  if (rec.baseDia && !rec.baseNota) rec.baseNota = 'Estimado capturado a mano';
   if (can('costos')) { rec.costo = num(g('costo')); rec.precio = tipo === 'producto' ? num(g('precio')) : 0; }
   else if (!old) { rec.costo = 0; rec.precio = 0; }
   if (old) rec.activo = f.elements.activo.checked;
+  if (!old && num(g('cantIni')) > 0) { const er = chkDate(g('fechaIni') || today(), { label: 'La fecha de la existencia inicial' }) || chkQty(num(g('cantIni')), 'La existencia inicial'); if (er) return toast(er, 'bad'); }
   put('items', rec);
   if (!old) {
     const q = num(g('cantIni'));
@@ -186,15 +198,26 @@ function kardexDS(id, from, to) {
   }
   return { title: 'Kardex · ' + it.nombre, sub: `Unidad: ${it.unidad} · ${from > '0000-01-01' ? fmtDate(from) + ' al ' + fmtDate(to) : 'historial completo'}`, cols: [{ t: 'Fecha', k: 'fecha' }, { t: 'Hora', k: 'hora' }, { t: 'Turno', k: 'turno' }, { t: 'Concepto', k: 'concepto' }, { t: 'Entrada', k: 'ent', n: 1 }, { t: 'Salida', k: 'sal', n: 1 }, { t: 'Saldo', k: 'saldo', n: 1 }, { t: 'Documento', k: 'doc' }, { t: 'Usuario', k: 'user' }, { t: 'Notas', k: 'nota' }], rows };
 }
+ACT.voidOpen = async el => {
+  const e = DB.movements.find(x => x.id === el.dataset.id); if (!e) return;
+  if (!await confirmBox('¿Anular esta apertura de unidad? La unidad volverá a contarse como Sellado.', 'Anular', true)) return;
+  del('movements', e.id); log('Anular apertura', itemById(e.itemId)?.nombre || ''); toast('Apertura anulada'); closeModal(); render();
+};
 ACT.kardex = el => {
   const it = itemById(el.dataset.id); S.kardexId = it.id; const s = itemStatus(it), lf = lotsOf(it.id);
   const lotRows = lf.lots.slice().reverse().slice(0, 12).map(l => `<tr><td>${fmtDate(l.fecha)}</td><td>${l.tipo === 'inicial' ? 'Existencia inicial' : TIPO_LABEL[l.tipo] || 'Ingreso'}</td><td class="r">${fmtQty(l.cant)}</td><td>${l.cierre ? fmtDate(l.cierre) : '<span class="chip info">en uso: ' + fmtQty(l.rest) + ' restantes</span>'}</td><td class="r">${l.dias ? l.dias + ' d' : l.cierre ? '1 d' : daysBetween(l.fecha, today()) + ' d (en curso)'}</td><td>${l.vence ? fmtDate(l.vence) : ''}</td></tr>`).join('');
   const ds = kardexDS(it.id, '0000-01-01', '9999-12-31');
   const stat = (l, v) => `<div class="kpi" style="padding:10px 12px"><small>${l}</small><b style="font-size:19px">${v}</b></div>`;
+  const ins = it.tipo === 'insumo', un = unitState(it.id), uc = unitCycles(it.id), lt = leadTimes().per.get(it.id);
+  const durU = uc.avg !== null ? (it.duracionEsp > 0 ? `${fmtN(uc.avg, 1)} d real vs ${fmtN(it.duracionEsp, 0)} d esperado` : fmtN(uc.avg, 1) + ' días') : '—';
+  const ucRows = [...uc.enUso.map(o => `<tr><td>${fmtDate(o.abrio)}</td><td><span class="chip info">En uso${o.cant > 1 ? ' ×' + fmtQty(o.cant) : ''}</span></td><td class="r">${o.dias} d (en curso)</td><td>${can('anular') ? `<button class="btn sm icon-btn" title="Anular esta apertura" data-act="voidOpen" data-id="${o.evId}">${ic('trash')}</button>` : ''}</td></tr>`),
+    ...uc.cyc.slice().reverse().slice(0, 10).map(c => `<tr><td>${fmtDate(c.abrio)}</td><td>${fmtDate(c.termino)}</td><td class="r">${c.dias} d</td><td></td></tr>`)].join('');
   const dur = it.duracionEsp > 0 && lf.avgLife ? `${fmtN(lf.avgLife, 0)} d real vs ${fmtN(it.duracionEsp, 0)} d esperado` : (lf.avgLife ? fmtN(lf.avgLife, 0) + ' días' : '—');
   openModal({
     title: `${esc(it.nombre)} <span style="margin-left:8px">${statusChip(s)}</span>`, size: 'wide',
-    body: `<div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">${stat('Existencia', fmtQty(s.st) + ' ' + esc(it.unidad))}${stat('Consumo / día', fmtN(s.u.perDay, 2))}${stat('Cobertura', s.cov === null ? '—' : fmtN(s.cov, 1) + ' días')}${stat('Se agota aprox.', s.agot ? fmtDate(s.agot) : '—')}${stat('Vida prom. de un lote', dur)}${stat('Cada cuánto se repone', lf.cicloRepo ? fmtN(lf.cicloRepo, 0) + ' días' : '—')}</div>
+    body: `<div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">${stat('Existencia', fmtQty(s.st) + ' ' + esc(it.unidad))}${stat('Consumo / día', fmtN(s.u.perDay, 2))}${stat('Cobertura', s.cov === null ? '—' : fmtN(s.cov, 1) + ' días')}${stat('Se agota aprox.', s.agot ? fmtDate(s.agot) : '—')}${stat('Vida prom. de un lote', dur)}${stat('Cada cuánto se repone', lf.cicloRepo ? fmtN(lf.cicloRepo, 0) + ' días' : '—')}${ins ? stat('Sellado / En uso', fmtQty(un.sellado) + ' / ' + fmtQty(un.uso)) + stat('Duración de 1 unidad', durU) : ''}${lt && lt.avg !== null ? stat('Tiempo de entrega', fmtN(lt.avg, 1) + ' días') : ''}${s.camino ? stat('En camino', fmtQty(s.camino) + ' ' + esc(it.unidad)) : ''}</div>
+    <p class="mut" style="margin:6px 0 10px"><small>Consumo/día: <b>${esc(s.u.origen)}</b>${s.u.origen === 'estimado' || s.u.origen === 'mixto' ? ` · base inicial ${fmtN(s.u.base * 30, 1)} por mes${it.baseNota ? ' (' + esc(it.baseNota) + ')' : ''}; se ajusta solo con el uso real` : ''}</small></p>
+    ${ins ? `<h4 class="mb">Unidades: de Sellado a Terminado <small class="mut">(cuántos días dura cada una)</small></h4><div class="tw mb"><table><thead><tr><th>Se abrió</th><th>Se terminó</th><th class="r">Duró</th><th></th></tr></thead><tbody>${ucRows || '<tr><td colspan="4" class="empty">Aún no hay unidades abiertas. Usa «Abrir» y «Terminar» en Inventario para medir cuánto dura cada una.</td></tr>'}</tbody></table></div>` : ''}
     <h4 class="mb">Lotes de ingreso y cuánto duraron <small class="mut">(método PEPS: lo primero que entra es lo primero que sale)</small></h4>
     <div class="tw mb"><table><thead><tr><th>Ingresó</th><th>Origen</th><th class="r">Cantidad</th><th>Se agotó</th><th class="r">Duración</th><th>Vence</th></tr></thead><tbody>${lotRows || '<tr><td colspan="6" class="empty">Sin ingresos registrados</td></tr>'}</tbody></table></div>
     <div class="row mb"><h4 class="sp">Historial de movimientos</h4>${expBtns('kardexItem')}</div>${dsTable({ ...ds, rows: ds.rows.slice().reverse().slice(0, 150) }, { maxh: '300px' })}`,
@@ -226,7 +249,7 @@ function movTable() {
   const body = shown.map(m => `<tr><td>${fmtDate(m.fecha)}<br><small class="mut">${esc(m.hora || '')} ${esc(m.turno || '')}</small></td><td><b>${esc(itemById(m.itemId).nombre)}</b></td>
     <td><span class="${m.dir === 'in' ? 'in-chip' : 'out-chip'}">${m.dir === 'in' ? '▲' : '▼'}</span> ${esc(TIPO_LABEL[m.tipo])}</td><td class="r"><b class="${m.dir === 'in' ? 'in-chip' : 'out-chip'}">${m.dir === 'in' ? '+' : '−'}${fmtQty(m.cant)}</b></td>
     <td>${esc(m.doc || '')}${m.provId ? '<br><small class="mut">' + esc(provName(m.provId)) + '</small>' : ''}</td><td>${esc(userName(m.userId))}</td><td style="max-width:260px"><small>${esc(m.nota || '')}</small></td>
-    <td><div class="act">${can('mov') && !m.src?.startsWith('turno') && m.src !== 'conteo' ? `<button class="btn sm icon-btn" title="Editar" data-act="editMov" data-id="${m.id}">${ic('edit')}</button>` : ''}${can('anular') ? `<button class="btn sm icon-btn" title="Anular" data-act="voidMov" data-id="${m.id}">${ic('trash')}</button>` : ''}</div></td></tr>`).join('');
+    <td><div class="act">${can('mov') && !m.src?.startsWith('turno') && m.src !== 'conteo' && m.src !== 'terminar' ? `<button class="btn sm icon-btn" title="Editar" data-act="editMov" data-id="${m.id}">${ic('edit')}</button>` : ''}${can('anular') ? `<button class="btn sm icon-btn" title="Anular" data-act="voidMov" data-id="${m.id}">${ic('trash')}</button>` : ''}</div></td></tr>`).join('');
   const ing = ds.foot.Entrada, egr = ds.foot.Salida;
   return `<div class="row mb"><span class="chip ok">Entradas: +${fmtQty(ing)}</span><span class="chip bad">Salidas: −${fmtQty(egr)}</span><span class="chip mut">Neto: ${fmtQty(ing - egr)}</span><small class="mut">${ds.rows.length} movimientos</small></div>
   <div class="tw"><table><thead><tr><th>Fecha</th><th>Artículo</th><th>Concepto</th><th class="r">Cantidad</th><th>Documento</th><th>Usuario</th><th>Notas</th><th></th></tr></thead><tbody>${body}</tbody></table></div>
@@ -291,8 +314,11 @@ CHG.movitem = el => {
 SUB.mov = async (f, e) => {
   const g = n => f.elements[n]?.value ?? '', dir = f.dataset.dir, tipo = g('tipo'), editId = g('editId');
   const lines = $$('.ml', f).map(tr => ({ itemId: tr.querySelector('[name=itemId]').value, cant: num(tr.querySelector('[name=cant]').value), costo: num(tr.querySelector('[name=costo]')?.value), precio: num(tr.querySelector('[name=precio]')?.value), vence: tr.querySelector('[name=vence]')?.value || '' })).filter(l => l.itemId || l.cant);
-  if (!g('fecha')) return toast('Indica la fecha', 'bad');
+  { const er = chkDate(g('fecha'), { label: 'La fecha del movimiento' }); if (er) return toast(er, 'bad'); }
   if (!lines.length || lines.some(l => !l.itemId || !(l.cant > 0))) return toast('Cada línea necesita un artículo y una cantidad mayor a 0', 'bad');
+  { const er = lines.map(l => chkQty(l.cant, 'La cantidad de ' + (itemById(l.itemId)?.nombre || 'un artículo'))).find(Boolean); if (er) return toast(er, 'bad'); }
+  { const v = lines.find(l => l.vence && dir === 'in' && l.vence < g('fecha')); if (v) return toast(`La fecha de vencimiento de ${itemById(v.itemId).nombre} es anterior a la del ingreso.`, 'bad'); }
+  { const dup = lines.find((l, i) => lines.findIndex(x => x.itemId === l.itemId) !== i); if (dup && !await confirmBox(`<b>${esc(itemById(dup.itemId).nombre)}</b> aparece más de una vez en esta ficha. ¿Registrar ambas líneas?`, 'Registrar igual')) return; }
   if (dir === 'out') { // validar existencias
     const need = {}; lines.forEach(l => need[l.itemId] = (need[l.itemId] || 0) + l.cant);
     const bad = Object.entries(need).filter(([id, q]) => stockOf(id) + (editId ? (DB.movements.find(m => m.id === editId)?.itemId === id ? DB.movements.find(m => m.id === editId).cant : 0) : 0) < q);

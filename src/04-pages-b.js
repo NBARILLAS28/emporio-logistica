@@ -124,22 +124,24 @@ ACT.cntView = el => {
 
 /* ---------------------------- SOLICITUDES ---------------------------- */
 S.reqF = '';
+const nextFolio = () => 'SOL-' + String(1 + Math.max(0, ...DB.requests.filter(r => /^SOL-/.test(r.folio || '')).map(r => parseInt((r.folio || '').replace(/\D/g, '')) || 0))).padStart(4, '0');
 const REQ_ST = { Borrador: 'mut', Enviada: 'info', Parcial: 'warn', Recibida: 'ok', Cancelada: 'bad' };
 PAGES.solicitudes = {
   title: 'Solicitudes de insumos y productos',
   html() {
     const all = L('requests').sort((a, b) => b.fecha.localeCompare(a.fecha) || b.u - a.u), rows = all.filter(r => !S.reqF || r.estado === S.reqF);
-    const body = rows.map(r => `<tr><td><b>${esc(r.folio)}</b></td><td>${fmtDate(r.fecha)}</td><td>${r.tipo === 'insumo' ? 'Insumos' : 'Productos para venta'}</td><td>${esc(r.destNombre || '—')}</td><td class="r">${r.lines.length}</td><td>${r.urgencia === 'Urgente' ? '<span class="chip bad">Urgente</span>' : 'Normal'}</td><td>${chip(r.estado, REQ_ST[r.estado])}${r.via ? ` <small class="mut">${r.via === 'wa' ? 'WhatsApp' : 'correo'}</small>` : ''}</td><td>${esc(r.solicitante || '')}</td><td><div class="act"><button class="btn sm" data-act="reqOpen" data-id="${r.id}">Ver / enviar</button></div></td></tr>`).join('');
+    const body = rows.map(r => { const act = reqActive(r), dias = reqWaitDays(r), tarde = act && dias > (cfg().diasEspera || 7), ok = r.lines.filter(l => l.recFecha), ent = ok.length ? ok.reduce((a, l) => a + Math.max(0, daysBetween(r.fecha, l.recFecha)), 0) / ok.length : null;
+      return `<tr><td><b>${esc(r.folio)}</b>${r.hist ? ' <small class="chip mut">histórico</small>' : ''}</td><td>${fmtDate(r.fecha)}</td><td>${r.tipo === 'insumo' ? 'Insumos' : 'Productos para venta'}</td><td>${esc(r.destNombre || '—')}</td><td class="r">${r.lines.length}</td><td>${r.urgencia === 'Urgente' ? '<span class="chip bad">Urgente</span>' : 'Normal'}</td><td>${chip(r.estado, REQ_ST[r.estado])}${r.via ? ` <small class="mut">${r.via === 'wa' ? 'WhatsApp' : 'correo'}</small>` : ''}</td><td>${act ? (tarde ? chip(dias + ' d · tarde', 'bad') : chip(dias + ' d esperando', 'info')) : ent !== null ? `<small>entrega prom. ${fmtN(ent, 1)} d</small>` : ''}</td><td>${esc(r.solicitante || '')}</td><td><div class="act"><button class="btn sm" data-act="reqOpen" data-id="${r.id}">Ver / enviar</button></div></td></tr>`; }).join('');
     return `<div class="tools"><div class="seg">${['', 'Borrador', 'Enviada', 'Parcial', 'Recibida', 'Cancelada'].map(e => `<button data-act="reqfilter" data-v="${e}" class="${S.reqF === e ? 'on' : ''}">${e || 'Todas'}</button>`).join('')}</div><span class="sp"></span>
      ${can('solicitud') ? `<button class="btn" data-act="reqNew" data-t="insumo">${ic('plus')} Solicitud de insumos</button><button class="btn pri" data-act="reqNew" data-t="producto">${ic('plus')} Solicitud de productos para venta</button>` : ''}</div>
-    ${rows.length ? `<div class="tw"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Tipo</th><th>Para</th><th class="r">Líneas</th><th>Urgencia</th><th>Estado</th><th>Solicitante</th><th></th></tr></thead><tbody>${body}</tbody></table></div>` : `<div class="card empty"><b>Sin solicitudes</b>Crea una solicitud y envíala por WhatsApp o correo al proveedor o a la gerencia. También puedes generarla desde las alertas del Tablero.</div>`}`;
+    ${rows.length ? `<div class="tw"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Tipo</th><th>Para</th><th class="r">Líneas</th><th>Urgencia</th><th>Estado</th><th>Espera / entrega</th><th>Solicitante</th><th></th></tr></thead><tbody>${body}</tbody></table></div>` : `<div class="card empty"><b>Sin solicitudes</b>Crea una solicitud y envíala por WhatsApp o correo al proveedor o a la gerencia. También puedes generarla desde las alertas del Tablero.</div>`}`;
   },
 };
 ACT.reqfilter = el => { S.reqF = el.dataset.v; render(); };
 ACT.reqNew = el => openRequestForm({ tipo: el.dataset.t });
 function reqLine(l = {}, tipo) {
   const it = l.itemId ? itemById(l.itemId) : null;
-  return `<tr class="rl"><td><select name="itemId" data-change="reqitem">${itemOptions(l.itemId, tipo)}</select><span class="ex">${it ? 'Existencia: ' + fmtQty(stockOf(it.id)) + ' ' + esc(it.unidad) : ''}</span></td><td class="r"><input class="q" name="cant" type="number" min="0" step="any" value="${l.cant ?? ''}"></td><td><button type="button" class="btn ghost icon-btn" data-act="rlrem">${ic('x')}</button></td></tr>`;
+  return `<tr class="rl"><td><select name="itemId" data-change="reqitem">${itemOptions(l.itemId, tipo)}</select><span class="ex">${it ? 'Existencia: ' + fmtQty(stockOf(it.id)) + ' ' + esc(it.unidad) + (onOrder(it.id) ? ' · en camino: ' + fmtQty(onOrder(it.id)) : '') + (it.pack > 0 ? ` · se compra ${esc(it.uCompra || 'paquete')} de ${fmtQty(it.pack)}` : '') : ''}</span></td><td class="r"><input class="q" name="cant" type="number" min="0" step="any" value="${l.cant ?? ''}"></td><td><button type="button" class="btn ghost icon-btn" data-act="rlrem">${ic('x')}</button></td></tr>`;
 }
 function openRequestForm({ tipo = 'producto', fromAlerts = false, id } = {}) {
   const r = id ? DB.requests.find(x => x.id === id) : null; tipo = r?.tipo || tipo;
@@ -160,7 +162,7 @@ function openRequestForm({ tipo = 'producto', fromAlerts = false, id } = {}) {
   });
 }
 CHG.reqprov = el => { const p = ix().provs.get(el.value), f = el.form; if (p) { f.elements.destNombre.value = p.nombre; f.elements.destTel.value = p.tel || ''; f.elements.destEmail.value = p.email || ''; } };
-CHG.reqitem = el => { const it = itemById(el.value), ex = el.closest('tr').querySelector('.ex'); ex.textContent = it ? `Existencia: ${fmtQty(stockOf(it.id))} ${it.unidad}` : ''; if (it && !el.closest('tr').querySelector('[name=cant]').value) { const s = itemStatus(it), q = suggestQty(it, s) || it.pack; if (q) el.closest('tr').querySelector('[name=cant]').value = q; } };
+CHG.reqitem = el => { const it = itemById(el.value), ex = el.closest('tr').querySelector('.ex'); ex.textContent = it ? `Existencia: ${fmtQty(stockOf(it.id))} ${it.unidad}${onOrder(it.id) ? ' · en camino: ' + fmtQty(onOrder(it.id)) : ''}${it.pack > 0 ? ` · se compra ${it.uCompra || 'paquete'} de ${fmtQty(it.pack)}` : ''}` : ''; if (it && !el.closest('tr').querySelector('[name=cant]').value) { const s = itemStatus(it), q = suggestQty(it, s) || it.pack; if (q) el.closest('tr').querySelector('[name=cant]').value = q; } };
 ACT.rladd = () => { $('#rlines').insertAdjacentHTML('beforeend', reqLine({}, $('#reqform').dataset.tipo)); };
 ACT.rlrem = el => { if ($$('#rlines .rl').length > 1) el.closest('tr').remove(); };
 ACT.reqSuggest = () => {
@@ -171,12 +173,16 @@ ACT.reqSuggest = () => {
 };
 SUB.req = f => {
   const g = n => f.elements[n]?.value ?? '', id = g('id'), tipo = f.dataset.tipo;
-  const lines = $$('.rl', f).map(tr => ({ itemId: tr.querySelector('[name=itemId]').value, cant: num(tr.querySelector('[name=cant]').value) })).filter(l => l.itemId && l.cant > 0);
+  let lines = $$('.rl', f).map(tr => ({ itemId: tr.querySelector('[name=itemId]').value, cant: num(tr.querySelector('[name=cant]').value) })).filter(l => l.itemId && l.cant > 0);
   if (!lines.length) return toast('Agrega al menos un artículo con cantidad', 'bad');
+  { const er = chkDate(g('fecha') || today(), { label: 'La fecha de la solicitud' }) || (g('fechaReq') ? chkDate(g('fechaReq'), { label: 'La fecha requerida', min: g('fecha') || today(), max: '' }) : '') || lines.map(l => chkQty(l.cant, 'La cantidad de ' + itemById(l.itemId).nombre)).find(Boolean); if (er) return toast(er, 'bad'); }
+  const merged = new Map(); lines.forEach(l => merged.set(l.itemId, (merged.get(l.itemId) || 0) + l.cant)); // un artículo repetido se suma en una sola línea
+  const dups = lines.length - merged.size; lines = [...merged].map(([itemId, cant]) => ({ itemId, cant }));
   const old = id ? DB.requests.find(x => x.id === id) : null;
-  const folio = old?.folio || 'SOL-' + String(1 + Math.max(0, ...DB.requests.map(r => parseInt((r.folio || '').replace(/\D/g, '')) || 0))).padStart(4, '0');
-  const rec = { ...(old || { id: uid(), estado: 'Borrador', userId: S.user.id }), folio, fecha: g('fecha') || today(), tipo, solicitante: g('solicitante'), urgencia: g('urgencia'), provId: g('provId'), destNombre: g('destNombre'), destTel: g('destTel'), destEmail: g('destEmail'), fechaReq: g('fechaReq'), nota: g('nota'), lines: lines.map(l => { const it = itemById(l.itemId); return { itemId: it.id, nombre: it.nombre, unidad: it.unidad, cant: l.cant, stock: stockOf(it.id) }; }) };
-  put('requests', rec); log(old ? 'Editar solicitud' : 'Crear solicitud', folio); closeModal(); render(); openRequest(rec.id);
+  const folio = old?.folio || nextFolio();
+  const prev = new Map((old?.lines || []).map(l => [l.itemId, l]));
+  const rec = { ...(old || { id: uid(), estado: 'Borrador', userId: S.user.id }), folio, fecha: g('fecha') || today(), tipo, solicitante: g('solicitante'), urgencia: g('urgencia'), provId: g('provId'), destNombre: g('destNombre'), destTel: g('destTel'), destEmail: g('destEmail'), fechaReq: g('fechaReq'), nota: g('nota'), lines: lines.map(l => { const it = itemById(l.itemId), p = prev.get(l.itemId) || {}; return { ...p, itemId: it.id, nombre: it.nombre, unidad: it.unidad, cant: l.cant, stock: stockOf(it.id) }; }) };
+  put('requests', rec); log(old ? 'Editar solicitud' : 'Crear solicitud', folio); if (dups) toast(`${dups} línea(s) repetida(s) se sumaron en una sola`); closeModal(); render(); openRequest(rec.id);
 };
 function openRequest(id) {
   const r = DB.requests.find(x => x.id === id); if (!r) return; S.reqId = id; EXPSRC.req = () => requestDS(r);
@@ -186,6 +192,7 @@ function openRequest(id) {
     title: `${esc(r.folio)} ${chip(r.estado, REQ_ST[r.estado])}`, size: 'mid',
     body: `<div class="row mb"><span class="mut sp">${r.tipo === 'insumo' ? 'Insumos' : 'Productos para venta'} · ${fmtDate(r.fecha)} · ${esc(r.destNombre || 'sin destinatario')}${r.destTel ? ' · WhatsApp ' + esc(r.destTel) : ''}${r.destEmail ? ' · ' + esc(r.destEmail) : ''}</span></div>
      <div class="tabs"><button class="on" data-act="reqfmt" data-f="wa">Mensaje WhatsApp</button><button data-act="reqfmt" data-f="mail">Mensaje de correo</button></div>
+     ${r.estado !== 'Borrador' ? reqLinesStatus(r) : ''}
      <div class="msgbox" id="reqmsg">${esc(requestMessage(r, 'wa'))}</div>
      ${!r.destTel && !cfg().waDefault ? '<small class="mut">Sin número de WhatsApp: se abrirá WhatsApp para que elijas el contacto.</small>' : ''}
      <div class="row mt"><a class="btn wa" href="${waLink(r)}" target="_blank" rel="noopener" data-sent="wa" data-rid="${r.id}">${ic('wa')} Enviar por WhatsApp</a>
@@ -195,9 +202,15 @@ function openRequest(id) {
       <button class="btn" data-act="reqCopy">${ic('copy')} Copiar</button></div>
      <div class="row mt">${expBtns('req')}</div>
      <small class="mut" style="display:block;margin-top:8px">Al enviar, WhatsApp o tu correo se abren con el mensaje listo; solo confirma el envío allí. Si el correo es largo y tu programa lo corta, usa «Copiar».</small>`,
-    foot: `${can('solicitud') && !cerrada ? `<button class="btn danger" data-act="reqCancel" data-id="${r.id}" style="margin-right:auto">Cancelar solicitud</button>` : ''}${can('solicitud') && r.estado === 'Borrador' ? `<button class="btn" data-act="reqEdit" data-id="${r.id}">${ic('edit')} Editar</button>` : ''}${can('mov') && !cerrada ? `<button class="btn pri" data-act="reqReceive" data-id="${r.id}">${ic('box2')} Registrar recepción</button>` : ''}<button class="btn" data-act="mclose">Cerrar</button>`,
+    foot: `${can('solicitud') && !cerrada ? `<button class="btn danger" data-act="reqCancel" data-id="${r.id}" style="margin-right:auto">Cancelar solicitud</button>` : ''}${can('solicitud') && r.estado === 'Borrador' ? `<button class="btn" data-act="reqEdit" data-id="${r.id}">${ic('edit')} Editar</button><button class="btn" data-act="reqSent" data-id="${r.id}" title="Si ya la enviaste por otro medio">Marcar como enviada</button>` : ''}${can('mov') && !cerrada && !r.hist ? `<button class="btn pri" data-act="reqReceive" data-id="${r.id}">${ic('box2')} Registrar recepción</button>` : ''}<button class="btn" data-act="mclose">Cerrar</button>`,
   });
 }
+function reqLinesStatus(r) {
+  const rows = r.lines.map(l => { const rec = l.recCant || 0, pend = Math.max(0, l.cant - rec), d = l.recFecha ? Math.max(0, daysBetween(r.fecha, l.recFecha)) : null;
+    return `<tr><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r">${fmtQty(rec)}</td><td>${l.recFecha ? fmtDate(l.recFecha) : '—'}</td><td class="r">${d !== null ? d + ' d' : ''}</td><td>${l.cerrada ? chip('cerrada', 'mut') : pend > 0 ? chip('pendiente ' + fmtQty(pend), r.hist ? 'mut' : 'warn') : chip('completa', 'ok')}</td></tr>`; }).join('');
+  return `<div class="tw mb" style="max-height:220px"><table><thead><tr><th>Artículo</th><th class="r">Pedido</th><th class="r">Recibido</th><th>Fecha recepción</th><th class="r">Entrega</th><th>Estado</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+ACT.reqSent = el => { const r = DB.requests.find(x => x.id === el.dataset.id); put('requests', { ...r, estado: 'Enviada', via: r.via || 'otro', enviada: Date.now() }); log('Enviar solicitud', r.folio + ' (marcada como enviada)'); closeModal(); render(); toast('Marcada como enviada', 'ok'); };
 ACT.reqOpen = el => openRequest(el.dataset.id);
 ACT.reqEdit = el => { closeModal(); openRequestForm({ id: el.dataset.id }); };
 ACT.reqfmt = el => { const r = DB.requests.find(x => x.id === S.reqId); $$('.tabs button', el.parentNode).forEach(b => b.classList.toggle('on', b === el)); $('#reqmsg').textContent = requestMessage(r, el.dataset.f); };
@@ -211,20 +224,31 @@ ACT.reqReceive = el => {
   const r = DB.requests.find(x => x.id === el.dataset.id), costos = can('costos');
   openModal({
     title: 'Registrar recepción · ' + esc(r.folio), size: 'mid',
-    body: `<form id="recform" data-submit="rec" data-id="${r.id}"><div class="grid g3"><div class="fld"><label>Fecha de recepción</label><input type="date" name="fecha" value="${today()}" max="${today()}"></div><div class="fld"><label>Documento / factura</label><input name="doc"></div><div class="fld"><label>Proveedor</label><select name="provId">${provOptions(r.provId)}</select></div></div>
-    <div class="tw"><table class="lines"><thead><tr><th>Artículo</th><th class="r">Solicitado</th><th class="r">Recibido</th>${costos ? '<th class="r">Costo unit.</th>' : ''}</tr></thead><tbody>${r.lines.map(l => `<tr data-id="${l.itemId}"><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r"><input class="q" name="rec" type="number" min="0" step="any" value="${l.cant}"></td>${costos ? `<td class="r"><input class="q" name="costo" type="number" min="0" step="any" value="${itemById(l.itemId)?.costo || ''}"></td>` : ''}</tr>`).join('')}</tbody></table></div>
-    <small class="mut">Se crearán los ingresos en el inventario con la fecha indicada.</small>
+    body: `<form id="recform" data-submit="rec" data-id="${r.id}"><div class="grid g3"><div class="fld"><label>Fecha de recepción</label><input type="date" name="fecha" value="${today()}" min="${r.fecha}" max="${today()}"></div><div class="fld"><label>Documento / factura</label><input name="doc"></div><div class="fld"><label>Proveedor</label><select name="provId">${provOptions(r.provId)}</select></div></div>
+    <div class="tw"><table class="lines"><thead><tr><th>Artículo</th><th class="r">Pedido</th><th class="r">Ya recibido</th><th class="r">Recibido hoy</th>${costos ? '<th class="r">Costo unit.</th>' : ''}<th title="Marca si lo que falta ya no llegará">Cerrar lo pendiente</th></tr></thead><tbody>${r.lines.map(l => { const pend = Math.max(0, l.cant - (l.recCant || 0)); return `<tr data-id="${l.itemId}"><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r">${fmtQty(l.recCant || 0)}</td><td class="r"><input class="q" name="rec" type="number" min="0" step="any" value="${l.cerrada ? 0 : pend}"</td>${costos ? `<td class="r"><input class="q" name="costo" type="number" min="0" step="any" value="${itemById(l.itemId)?.costo || ''}"></td>` : ''}<td style="text-align:center"><input type="checkbox" name="cerrar" style="width:auto" ${l.cerrada ? 'checked' : ''}></td></tr>`; }).join('')}</tbody></table></div>
+    <small class="mut">Se crearán los ingresos en el inventario con la fecha indicada y quedará registrado cuántos días tardó cada artículo.</small>
     <div class="mf" style="padding:12px 0 0;border:0"><button type="button" class="btn" data-act="mclose">Cancelar</button><button class="btn pri">Registrar ingreso</button></div></form>`,
   });
 };
 SUB.rec = f => {
-  const r = DB.requests.find(x => x.id === f.dataset.id); let full = true, n = 0;
-  $$('tbody tr', f).forEach(tr => {
-    const q = num(tr.querySelector('[name=rec]').value), l = r.lines.find(x => x.itemId === tr.dataset.id), it = itemById(tr.dataset.id);
-    if (q < l.cant) full = false; if (q > 0 && it) { const c = num(tr.querySelector('[name=costo]')?.value) || it.costo; put('movements', mkMove({ itemId: it.id, dir: 'in', tipo: 'compra', cant: q, fecha: f.elements.fecha.value, doc: f.elements.doc.value || r.folio, provId: f.elements.provId.value, reqId: r.id, src: 'solicitud', costoU: c, nota: 'Recepción de ' + r.folio })); if (c > 0 && c !== it.costo && can('costos')) put('items', { ...it, costo: c }); n++; }
-  });
-  put('requests', { ...r, estado: full ? 'Recibida' : 'Parcial', recibida: f.elements.fecha.value }); log('Recepción de solicitud', `${r.folio} · ${n} artículos`);
-  closeModal(); toast('Ingreso registrado en el inventario', 'ok'); render();
+  const r = DB.requests.find(x => x.id === f.dataset.id), fecha = f.elements.fecha.value;
+  { const er = chkDate(fecha, { label: 'La fecha de recepción', min: r.fecha }); if (er) return toast(er, 'bad'); }
+  const rows = $$('tbody tr', f).map(tr => ({ tr, l: r.lines.find(x => x.itemId === tr.dataset.id), it: itemById(tr.dataset.id), q: num(tr.querySelector('[name=rec]').value), cerrar: tr.querySelector('[name=cerrar]').checked }));
+  { const er = rows.filter(x => x.q > 0).map(x => chkQty(x.q, 'La cantidad recibida de ' + x.l.nombre)).find(Boolean); if (er) return toast(er, 'bad'); }
+  const exceso = rows.find(x => x.q > 0 && (x.l.recCant || 0) + x.q > x.l.cant * 1.5 + 1e-9);
+  if (!rows.some(x => x.q > 0) && !rows.some(x => x.cerrar && !x.l.cerrada)) return toast('Escribe al menos una cantidad recibida', 'bad');
+  const go = () => {
+    let n = 0;
+    const lines = r.lines.map(l => { const x = rows.find(y => y.l === l); if (!x) return l; const nl = { ...l };
+      if (x.q > 0) { nl.recCant = (l.recCant || 0) + x.q; nl.recFecha = fecha; }
+      nl.cerrada = x.cerrar && nl.cant > (nl.recCant || 0); return nl; });
+    rows.forEach(x => { if (x.q > 0 && x.it) { const c = num(x.tr.querySelector('[name=costo]')?.value) || x.it.costo; put('movements', mkMove({ itemId: x.it.id, dir: 'in', tipo: 'compra', cant: x.q, fecha, doc: f.elements.doc.value || r.folio, provId: f.elements.provId.value, reqId: r.id, src: 'solicitud', costoU: c, nota: 'Recepción de ' + r.folio })); if (c > 0 && c !== x.it.costo && can('costos')) put('items', { ...x.it, costo: c }); n++; } });
+    const full = lines.every(l => (l.recCant || 0) >= l.cant || l.cerrada);
+    put('requests', { ...r, lines, estado: full ? 'Recibida' : 'Parcial', recibida: fecha }); log('Recepción de solicitud', `${r.folio} · ${n} artículos`);
+    closeModal(); toast('Ingreso registrado en el inventario', 'ok'); render();
+  };
+  if (exceso) return confirmBox(`Recibes bastante más de lo pedido de <b>${esc(exceso.l.nombre)}</b> (pedido ${fmtQty(exceso.l.cant)}, recibido ${fmtQty((exceso.l.recCant || 0) + exceso.q)}). ¿Es correcto?`, 'Sí, registrar').then(ok => ok && go());
+  go();
 };
 
 /* ---------------------------- REPORTES ---------------------------- */
@@ -268,15 +292,23 @@ const REP = {
     build() {
       const { from, to } = periodRange(); const hasta = to > today() ? today() : to, dias = Math.max(1, daysBetween(from, hasta) + 1);
       const rows = repItems().map(it => { const s = summarize(it.id, from, to), st = itemStatus(it), lf = lotsOf(it.id); return { it, s, st, lf }; });
-      const cols = [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Consumo en el periodo', k: r => r.s.consumo, n: 1 }, { t: 'Promedio por día (periodo)', k: r => r.s.consumo / dias, n: 1, d: 2 }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Se agota aprox.', k: r => r.st.agot ? fmtDate(r.st.agot) : '' }, { t: 'Vida prom. de un lote (días)', k: r => r.lf.avgLife ?? '', n: 1, d: 0 }, { t: 'Se repone cada (días)', k: r => r.lf.cicloRepo ?? '', n: 1, d: 0 }, { t: 'Duración esperada (días)', k: r => r.it.duracionEsp || '', n: 1, d: 0 }, { t: 'Estado', k: r => r.st.est }];
+      const cols = [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Consumo en el periodo', k: r => r.s.consumo, n: 1 }, { t: 'Promedio por día (periodo)', k: r => r.s.consumo / dias, n: 1, d: 2 }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Origen del consumo', k: r => r.st.u.origen }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Se agota aprox.', k: r => r.st.agot ? fmtDate(r.st.agot) : '' }, { t: 'Sellado', k: r => r.it.tipo === 'insumo' ? unitState(r.it.id).sellado : '', n: 1 }, { t: 'En uso', k: r => r.it.tipo === 'insumo' ? unitState(r.it.id).uso : '', n: 1 }, { t: 'Duración de 1 unidad (días)', k: r => r.it.tipo === 'insumo' ? unitCycles(r.it.id).avg ?? '' : '', n: 1, d: 1 }, { t: 'Vida prom. de un lote (días)', k: r => r.lf.avgLife ?? '', n: 1, d: 0 }, { t: 'Se repone cada (días)', k: r => r.lf.cicloRepo ?? '', n: 1, d: 0 }, { t: 'Duración esperada (días)', k: r => r.it.duracionEsp || '', n: 1, d: 0 }, { t: 'Estado', k: r => r.st.est }];
       return { title: 'Consumo y tiempo de uso', sub: `${periodLabel()} · cobertura calculada con el consumo de los últimos ${cfg().ventanaConsumo} días · vida de lote por método PEPS`, cols, rows };
+    },
+  },
+  entregas: {
+    n: 'Tiempos de entrega', d: 'Cuántos días tarda cada artículo desde que se solicita hasta que llega, y qué sigue pendiente', noPeriod: true,
+    build() {
+      const lt = leadTimes(); const rows = repItems().map(it => ({ it, a: lt.per.get(it.id) })).filter(r => r.a).sort((x, y) => (y.a.avg ?? -1) - (x.a.avg ?? -1));
+      return { title: 'Tiempos de entrega de solicitudes', sub: `${lt.n} entregas registradas · entrega típica (mediana): ${lt.med === null ? '—' : fmtN(lt.med, 1) + ' días'} · promedio: ${lt.avg === null ? '—' : fmtN(lt.avg, 1) + ' días'} · alerta de «tarde» después de ${cfg().diasEspera} días`,
+        cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Área', k: r => catName(r.it.catId) }, { t: 'Solicitudes', k: r => r.a.n, n: 1 }, { t: 'Recibidas', k: r => r.a.rec, n: 1 }, { t: 'Entrega promedio (días)', k: r => r.a.avg ?? '', n: 1, d: 1 }, { t: 'Entrega máxima (días)', k: r => r.a.max ?? '', n: 1 }, { t: 'Pendientes', k: r => r.a.pend, n: 1 }, { t: 'En camino (uds)', k: r => onOrder(r.it.id) || '', n: 1 }], rows };
     },
   },
   pedido: {
     n: 'Pedido sugerido', d: 'Artículos agotados, bajo mínimo o por agotarse, con cantidad sugerida', noPeriod: true,
     build() {
       const rows = repItems().map(it => ({ it, st: itemStatus(it) })).filter(r => NEEDS.includes(r.st.est)).map(r => ({ ...r, q: suggestQty(r.it, r.st) }));
-      return { title: 'Pedido sugerido', sub: `Al ${fmtDate(today())} · objetivo: ${cfg().diasObjetivo} días de cobertura o stock máximo del artículo`, cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Estado', k: r => r.st.est }, { t: 'Cantidad sugerida', k: r => r.q, n: 1 }, { t: 'Proveedor', k: r => provName(r.it.provId) }], rows };
+      return { title: 'Pedido sugerido', sub: `Al ${fmtDate(today())} · objetivo: ${cfg().diasObjetivo} días de cobertura o stock máximo del artículo`, cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Estado', k: r => r.st.est }, { t: 'En camino', k: r => r.st.camino || '', n: 1 }, { t: 'Cantidad sugerida', k: r => r.q, n: 1 }, { t: 'Proveedor', k: r => provName(r.it.provId) }], rows };
     },
   },
   flujo: {

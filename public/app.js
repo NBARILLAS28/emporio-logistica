@@ -48,7 +48,7 @@ const PERM_LABEL = {
 const DEFAULT_SETTINGS = {
   empresa: 'EMPORIO', sucursal: 'Chimaltenango', moneda: 'Q',
   turnoAM: 'Turno AM (5:00)', turnoPM: 'Turno PM (2:00)',
-  ventanaConsumo: 30, diasReposicion: 7, diasObjetivo: 14,
+  ventanaConsumo: 30, diasReposicion: 7, diasObjetivo: 14, diasEspera: 7, diasCierre: 30,
   waDefault: '', emailDefault: '', pais: '502', u: 0,
 };
 const COLS = ['users', 'categories', 'suppliers', 'items', 'movements', 'requests', 'counts', 'audit'];
@@ -121,6 +121,20 @@ function setSaveStatus(st) {
 }
 
 
+/* ---------- validaciones de captura ---------- */
+function chkDate(iso, { min = '', max = today(), label = 'La fecha' } = {}) {
+  if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso) || isNaN(fromISO(iso))) return `${label} no es válida.`;
+  if (iso < '2020-01-01') return `${label} (${fmtDate(iso)}) es demasiado antigua; revisa el año.`;
+  if (max && iso > max) return `${label} (${fmtDate(iso)}) no puede ser posterior a ${fmtDate(max)}.`;
+  if (min && iso < min) return `${label} (${fmtDate(iso)}) no puede ser anterior a ${fmtDate(min)}.`;
+  return '';
+}
+function chkQty(q, label = 'La cantidad', { max = 1e6 } = {}) {
+  if (!(q > 0)) return `${label} debe ser un número mayor a 0.`;
+  if (q > max) return `${label} (${fmtQty(q)}) es demasiado grande; revisa si falta un punto decimal.`;
+  return '';
+}
+
 /* ---------- acceso a colecciones ---------- */
 const L = col => DB[col].filter(r => !r.del);
 function put(col, rec) {
@@ -135,11 +149,15 @@ function ix() {
   if (_ix) return _ix;
   const items = DB.items.filter(r => !r.del);
   const map = new Map(items.map(i => [i.id, i]));
-  const moves = DB.movements.filter(m => !m.del && map.has(m.itemId));
+  const all = DB.movements.filter(m => !m.del && map.has(m.itemId));
+  const moves = all.filter(m => m.dir !== 'ev');             // movimientos que cambian la existencia
+  const evs = new Map();                                      // eventos que no mueven stock: abrir unidad, notas de cierre
+  for (const m of all) if (m.dir === 'ev') { let a = evs.get(m.itemId); if (!a) { a = []; evs.set(m.itemId, a); } a.push(m); }
+  evs.forEach(a => a.sort((x, y) => x.fecha.localeCompare(y.fecha) || (x.hora || '').localeCompare(y.hora || '') || ((x.u || 0) - (y.u || 0))));
   moves.sort((a, b) => a.fecha.localeCompare(b.fecha) || (a.hora || '').localeCompare(b.hora || '') || ((a.u || 0) - (b.u || 0)));
   const byItem = new Map();
   for (const m of moves) { let a = byItem.get(m.itemId); if (!a) { a = []; byItem.set(m.itemId, a); } a.push(m); }
-  _ix = { items, map, moves, byItem, cats: new Map(L('categories').map(c => [c.id, c])), provs: new Map(L('suppliers').map(c => [c.id, c])), users: new Map(DB.users.map(u => [u.id, u])) };
+  _ix = { items, map, moves, byItem, evs, cats: new Map(L('categories').map(c => [c.id, c])), provs: new Map(L('suppliers').map(c => [c.id, c])), users: new Map(DB.users.map(u => [u.id, u])) };
   return _ix;
 }
 const itemById = id => ix().map.get(id);
@@ -212,6 +230,11 @@ function summarize(id, from, to) {
   r.cierre = r.ini + r.ing + r.aj - r.egr;
   return r;
 }
+/* Consumo por día calculado automáticamente:
+   · real      → lo medido en los movimientos de la ventana (salidas por uso, venta, merma…, incluye «Terminar unidad»)
+   · estimado  → consumo inicial del artículo (tomado del Excel de Octubre) mientras no hay datos propios
+   · mixto     → mezcla ponderada; el consumo real va ganando peso hasta cubrir 30 días de datos
+   Así el programa se «autoajusta» sin que nadie capture reglas a mano. */
 function usage(id, win) {
   win = win || cfg().ventanaConsumo || 30;
   const arr = ix().byItem.get(id) || [];
@@ -220,8 +243,72 @@ function usage(id, win) {
   if (start > end) start = end;
   const days = Math.max(1, daysBetween(start, end) + 1);
   let total = 0; for (const m of arr) if (m.fecha >= start && m.fecha <= end && CONSUMO.includes(m.tipo)) total += m.cant;
-  return { total, days, perDay: total / days };
+  const real = total / days, base = ix().map.get(id)?.baseDia || 0;
+  let perDay = real, origen = total > 0 ? 'real' : 'sin datos';
+  if (base > 0) {
+    if (total <= 0) { perDay = base; origen = 'estimado'; }
+    else { const w = Math.min(1, days / 30); perDay = w * real + (1 - w) * base; origen = w >= 1 ? 'real' : 'mixto'; }
+  }
+  return { total, days, perDay, origen, real, base };
 }
+
+/* ---------- unidades: Sellado → En uso → Terminado ---------- */
+/* «Terminar unidad» = salida por uso con src 'terminar'; «Abrir unidad» = evento (no mueve existencia).
+   Existencia real = Sellado + En uso. Lo Terminado ya salió del inventario. */
+function unitState(id, upTo) {
+  let opened = 0, done = 0;
+  for (const e of (ix().evs.get(id) || [])) { if (upTo && e.fecha > upTo) break; if (e.tipo === 'abrir') opened += e.cant; }
+  for (const m of (ix().byItem.get(id) || [])) { if (upTo && m.fecha > upTo) break; if (m.src === 'terminar' && m.dir === 'out') done += m.cant; }
+  const st = Math.max(0, stockOf(id, upTo)), uso = Math.min(st, Math.max(0, opened - done));
+  return { st, uso, sellado: st - uso, opened, done };
+}
+/* Ciclos de vida de cada unidad (PEPS): cuándo se abrió y cuándo se terminó */
+function unitCycles(id) {
+  const opens = [], cyc = [];
+  for (const e of (ix().evs.get(id) || [])) if (e.tipo === 'abrir') opens.push({ fecha: e.fecha, rest: e.cant, evId: e.id });
+  for (const m of (ix().byItem.get(id) || [])) {
+    if (m.src !== 'terminar' || m.dir !== 'out') continue;
+    let q = m.cant;
+    for (const o of opens) { if (q <= 0) break; if (o.rest > 0) { const t = Math.min(o.rest, q); o.rest -= t; q -= t; for (let i = 0; i < t; i++) cyc.push({ abrio: o.fecha, termino: m.fecha, dias: Math.max(1, daysBetween(o.fecha, m.fecha)) }); } }
+  }
+  const enUso = opens.filter(o => o.rest > 0).map(o => ({ abrio: o.fecha, cant: o.rest, dias: daysBetween(o.fecha, today()), evId: o.evId }));
+  const avg = cyc.length ? cyc.reduce((a, c) => a + c.dias, 0) / cyc.length : null;
+  return { cyc, enUso, avg, opens };
+}
+
+/* ---------- solicitudes: pedidos en camino y tiempos de entrega ---------- */
+const reqActive = r => !r.del && !r.hist && (r.estado === 'Enviada' || r.estado === 'Parcial');
+function onOrderMap() {
+  const X = ix(); if (X.oo) return X.oo;
+  const m = X.oo = new Map();
+  for (const r of DB.requests) { if (!reqActive(r)) continue; for (const l of r.lines || []) { const pend = Math.max(0, (l.cant || 0) - (l.recCant || 0)); if (pend > 0 && !l.cerrada) m.set(l.itemId, (m.get(l.itemId) || 0) + pend); } }
+  return m;
+}
+const onOrder = id => onOrderMap().get(id) || 0;
+const reqWaitDays = r => Math.max(0, daysBetween(r.fecha, today()));
+function pendingRequests() {
+  return L('requests').filter(reqActive).map(r => ({ r, dias: reqWaitDays(r), tarde: reqWaitDays(r) > (cfg().diasEspera || 7), pend: (r.lines || []).filter(l => (l.cant || 0) > (l.recCant || 0) && !l.cerrada).length }))
+    .sort((a, b) => b.dias - a.dias);
+}
+/* tiempo de entrega por artículo: de la fecha de solicitud a la fecha de recepción de cada línea */
+function leadTimes() {
+  const per = new Map(); let all = [];
+  for (const r of L('requests')) {
+    if (r.estado === 'Cancelada') continue;
+    for (const l of r.lines || []) {
+      if (!l.itemId) continue; let a = per.get(l.itemId); if (!a) { a = { n: 0, rec: 0, dias: [], pend: 0 }; per.set(l.itemId, a); }
+      a.n++;
+      if (l.recFecha) { const d = Math.max(0, daysBetween(r.fecha, l.recFecha)); a.rec++; a.dias.push(d); all.push(d); }
+      else if (!r.hist && reqActive(r) && !l.cerrada) a.pend++;
+    }
+  }
+  const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+  per.forEach(a => { a.avg = avg(a.dias); a.max = a.dias.length ? Math.max(...a.dias) : null; });
+  // la mediana evita que un solo error de captura distorsione el promedio global
+  const sorted = all.slice().sort((x, y) => x - y), med = sorted.length ? (sorted.length % 2 ? sorted[(sorted.length - 1) / 2] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2) : null;
+  return { per, avg: avg(all), med, n: all.length };
+}
+
 /* Lotes FIFO: mide cuánto tiempo dura cada ingreso hasta agotarse */
 function lotsOf(id) {
   const lots = [];
@@ -252,11 +339,11 @@ function itemStatus(it) {
   else if (cov !== null && cov < (cfg().diasReposicion || 7)) { est = 'Por agotarse'; cls = 'warn'; }
   else if (u.perDay === 0) { est = 'Sin movimiento'; cls = 'mut'; }
   else { est = 'OK'; cls = 'ok'; }
-  return { st, u, min, cov, est, cls, agot: cov !== null && st > 0 ? addDays(today(), Math.floor(cov)) : null };
+  return { st, u, min, cov, est, cls, camino: onOrder(it.id), agot: cov !== null && st > 0 ? addDays(today(), Math.floor(cov)) : null };
 }
 function suggestQty(it, s) {
   const target = it.max > 0 ? it.max : Math.ceil(s.u.perDay * (cfg().diasObjetivo || 14));
-  let q = Math.max(0, Math.ceil(target - s.st));
+  let q = Math.max(0, Math.ceil(target - s.st - (s.camino ?? onOrder(it.id))));
   if (it.pack > 0 && q > 0) q = Math.ceil(q / it.pack) * it.pack;
   return q;
 }
@@ -569,7 +656,7 @@ function requestMessage(rq, mode) {
   if (rq.destNombre) out.push(`Para: ${rq.destNombre}`);
   out.push('');
   out.push(B('Detalle:'));
-  rq.lines.forEach((l, i) => out.push(`${i + 1}. ${l.nombre} - ${fmtQty(l.cant)} ${l.unidad || 'unidad'}${l.stock !== undefined ? `  (existencia actual: ${fmtQty(l.stock)})` : ''}`));
+  rq.lines.forEach((l, i) => out.push(`${i + 1}. ${l.nombre} - ${fmtQty(l.cant)} ${l.unidad || 'unidad'}${l.stock !== undefined ? `  (existencia actual: ${fmtQty(l.stock)})` : ''}${l.just ? `\n    Motivo: ${l.just}` : ''}`));
   if (rq.nota) { out.push(''); out.push(B('Notas:')); out.push(rq.nota); }
   out.push(''); out.push('Gracias.');
   return out.join('\n');
@@ -589,7 +676,7 @@ function requestDS(rq) {
   return {
     title: `Solicitud ${rq.folio} · ${rq.tipo === 'insumo' ? 'Insumos' : 'Productos para venta'}`,
     sub: `Fecha ${fmtDate(rq.fecha)} · Solicitante: ${rq.solicitante || '-'} · Para: ${rq.destNombre || '-'} · Urgencia: ${rq.urgencia}${rq.fechaReq ? ' · Requerida: ' + fmtDate(rq.fechaReq) : ''}${rq.nota ? ' · Nota: ' + rq.nota : ''}`,
-    cols: [{ t: '#', k: r => r._i }, { t: 'Artículo', k: 'nombre' }, { t: 'Unidad', k: 'unidad' }, { t: 'Existencia', k: 'stock', n: 1 }, { t: 'Cantidad solicitada', k: 'cant', n: 1 }],
+    cols: [{ t: '#', k: r => r._i }, { t: 'Artículo', k: 'nombre' }, { t: 'Unidad', k: 'unidad' }, { t: 'Existencia', k: 'stock', n: 1 }, { t: 'Cantidad solicitada', k: 'cant', n: 1 }, ...(rq.lines.some(l => l.just) ? [{ t: 'Motivo', k: 'just' }] : [])],
     rows: rq.lines.map((l, i) => ({ ...l, _i: i + 1 })),
   };
 }
@@ -758,6 +845,7 @@ const NAV = [
   { id: 'turno', t: 'Cierre de turno', i: 'check', p: 'turno' },
   { id: 'conteo', t: 'Conteo físico', i: 'scale', p: 'ajuste' },
   { id: 'solicitudes', t: 'Solicitudes', i: 'send', p: 'ver' },
+  { id: 'cierre', t: 'Cierre de mes', i: 'clock', p: 'reportes' },
   { sec: 'Análisis' },
   { id: 'reportes', t: 'Reportes', i: 'file', p: 'reportes' },
   { sec: 'Administración' },
@@ -894,9 +982,11 @@ PAGES.dashboard = {
     const maxCov = Math.max(1, (cfg().diasObjetivo || 14) * 2);
     const usoRows = tieneUso.map(r => {
       const lf = lotsOf(r.it.id), pct = Math.min(100, r.st.cov / maxCov * 100), cl = r.st.cov < (cfg().diasReposicion || 7) ? 'bad' : r.st.cov < (cfg().diasObjetivo || 14) ? 'warn' : '';
-      return `<tr><td>${esc(r.it.nombre)}</td><td class="r">${fmtQty(r.st.st)}</td><td class="r">${fmtN(r.st.u.perDay, 1)}</td><td style="min-width:130px"><div class="row" style="gap:8px;flex-wrap:nowrap"><div class="bar ${cl}" style="flex:1"><i style="width:${pct}%"></i></div><b class="num" style="min-width:34px;text-align:right">${fmtN(r.st.cov, 1)}</b></div></td><td>${fmtDate(r.st.agot)}</td><td class="r">${lf.avgLife ? fmtN(lf.avgLife, 0) : '—'}</td></tr>`;
+      return `<tr><td>${esc(r.it.nombre)}</td><td class="r">${fmtQty(r.st.st)}</td><td class="r">${fmtN(r.st.u.perDay, r.st.u.perDay < 1 ? 2 : 1)}</td><td style="min-width:130px"><div class="row" style="gap:8px;flex-wrap:nowrap"><div class="bar ${cl}" style="flex:1"><i style="width:${pct}%"></i></div><b class="num" style="min-width:34px;text-align:right">${fmtN(r.st.cov, 1)}</b></div></td><td>${fmtDate(r.st.agot)}</td><td class="r">${lf.avgLife ? fmtN(lf.avgLife, 0) : '—'}</td><td class="r">${(() => { const a = unitCycles(r.it.id).avg; return a !== null ? fmtN(a, 1) : '—'; })()}</td></tr>`;
     }).join('');
-    const alertRows = alerts.slice(0, 9).map(r => `<tr><td>${esc(r.it.nombre)} <small class="mut">${r.it.tipo === 'insumo' ? '· insumo' : ''}</small></td><td class="r">${fmtQty(r.st.st)}</td><td class="r">${r.st.min || '—'}</td><td>${statusChip(r.st)}</td><td class="r"><b>${fmtQty(suggestQty(r.it, r.st))}</b></td></tr>`).join('');
+    const alertRows = alerts.slice(0, 9).map(r => `<tr><td>${esc(r.it.nombre)} <small class="mut">${r.it.tipo === 'insumo' ? '· insumo' : ''}</small></td><td class="r">${fmtQty(r.st.st)}</td><td class="r">${r.st.min || '—'}</td><td>${statusChip(r.st)}${r.st.camino ? ` <small class="chip info">+${fmtQty(r.st.camino)} en camino</small>` : ''}</td><td class="r"><b>${fmtQty(suggestQty(r.it, r.st))}</b></td></tr>`).join('');
+    const pend = pendingRequests(), lt = leadTimes();
+    const pendHTML = pend.length ? `<div class="card"><h3>Solicitudes en espera <small>${pend.length} sin recibir completas${lt.med !== null ? ` · entrega típica: ${fmtN(lt.med, 0)} días` : ''}</small><button class="btn sm" data-act="go" data-page="solicitudes">Ver solicitudes</button></h3><div class="tw"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Para</th><th class="r">Pendientes</th><th class="r">Espera</th></tr></thead><tbody>${pend.slice(0, 6).map(p => `<tr><td><b>${esc(p.r.folio)}</b></td><td>${fmtDate(p.r.fecha)}</td><td>${esc(p.r.destNombre || (p.r.tipo === 'insumo' ? 'Insumos' : 'Productos'))}</td><td class="r">${p.pend} art.</td><td class="r">${p.tarde ? chip(p.dias + ' d · tarde', 'bad') : chip(p.dias + ' d', 'info')}</td></tr>`).join('')}</tbody></table></div></div>` : '';
     const nProd = alerts.filter(r => r.it.tipo === 'producto').length, nIns = alerts.filter(r => r.it.tipo === 'insumo').length;
     const venc = []; items.forEach(it => lotsOf(it.id).lots.forEach(l => { if (l.rest > 0 && l.vence && l.vence <= addDays(today(), 30)) venc.push({ it, l }); })); venc.sort((a, b) => a.l.vence.localeCompare(b.l.vence));
     const vencHTML = venc.length ? `<h3 class="mt">Por vencer <small>próximos 30 días</small></h3><div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Quedan</th><th>Vence</th></tr></thead><tbody>${venc.slice(0, 6).map(v => `<tr><td>${esc(v.it.nombre)}</td><td class="r">${fmtQty(v.l.rest)}</td><td>${fmtDate(v.l.vence)} ${v.l.vence < today() ? chip('Vencido', 'bad') : chip(daysBetween(today(), v.l.vence) + ' d', 'warn')}</td></tr>`).join('')}</tbody></table></div>` : '';
@@ -907,8 +997,9 @@ PAGES.dashboard = {
      <div class="cols3"><div class="card"><h3>Mayor salida en el periodo <small>unidades</small></h3><div class="chartbox sm"><canvas id="ch-top"></canvas></div></div>
        <div class="card"><h3>Alertas de reposición ${can('solicitud') && alerts.length ? `<span class="row" style="gap:6px">${nProd ? `<button class="btn sm pri" data-act="reqAlerts" data-t="producto">${ic('send')} Solicitar productos (${nProd})</button>` : ''}${nIns ? `<button class="btn sm pri" data-act="reqAlerts" data-t="insumo">${ic('send')} Solicitar insumos (${nIns})</button>` : ''}</span>` : ''}</h3>
        ${alertRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Exist.</th><th class="r">Mín.</th><th>Estado</th><th class="r">Sugerido</th></tr></thead><tbody>${alertRows}</tbody></table></div>${alerts.length > 9 ? `<small class="mut">+${alerts.length - 9} más en el reporte «Pedido sugerido»</small>` : ''}` : '<div class="empty"><b>Todo en orden</b>No hay artículos por reponer.</div>'}${vencHTML}</div></div>
+     ${pendHTML}
      <div class="card"><h3>Tiempo de uso y cobertura <small>según el consumo de los últimos ${cfg().ventanaConsumo} días</small><button class="btn sm" data-act="go" data-page="reportes" data-rep="consumo">Ver reporte completo</button></h3>
-       ${usoRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Consumo/día</th><th>Cobertura (días)</th><th>Se agota aprox.</th><th class="r" title="Días promedio que tarda en agotarse cada ingreso (método PEPS)">Vida prom. de lote (días)</th></tr></thead><tbody>${usoRows}</tbody></table></div>` : '<div class="empty">Aún no hay consumo suficiente para estimar la duración.</div>'}</div>`;
+       ${usoRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Consumo/día</th><th>Cobertura (días)</th><th>Se agota aprox.</th><th class="r" title="Días promedio que tarda en agotarse cada ingreso (método PEPS)">Vida prom. de lote (días)</th><th class="r" title="Días promedio entre abrir y terminar una unidad">Duración de 1 unidad (días)</th></tr></thead><tbody>${usoRows}</tbody></table></div>` : '<div class="empty">Aún no hay consumo suficiente para estimar la duración.</div>'}</div>`;
   },
   mount() {
     if (!window.Chart || !ix().items.length) return; chartDefaults();
@@ -945,22 +1036,26 @@ function invRows() {
 }
 function invDS() {
   const costos = can('costos');
-  const cols = [{ t: 'Código', k: r => r.it.codigo || '' }, { t: 'Artículo', k: r => r.it.nombre }, { t: 'Categoría', k: r => catName(r.it.catId) }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Existencia', k: r => r.st.st, n: 1, d: 0 },
-  { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Estado', k: r => r.st.est }];
+  const ins = S.invTab === 'insumo';
+  const cols = [{ t: 'Código', k: r => r.it.codigo || '' }, { t: 'Artículo', k: r => r.it.nombre }, { t: ins ? 'Área' : 'Categoría', k: r => catName(r.it.catId) }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Existencia', k: r => r.st.st, n: 1, d: 0 },
+  ...(ins ? [{ t: 'Sellado', k: r => unitState(r.it.id).sellado, n: 1 }, { t: 'En uso', k: r => unitState(r.it.id).uso, n: 1 }, { t: 'En camino', k: r => r.st.camino || '', n: 1 }] : []),
+  { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 2 }, { t: 'Origen del consumo', k: r => r.st.u.origen }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, ...(ins ? [{ t: 'Duración de 1 unidad (días)', k: r => unitCycles(r.it.id).avg ?? '', n: 1, d: 1 }] : []), { t: 'Estado', k: r => r.st.est }];
   if (costos) cols.push({ t: 'Costo', k: r => r.it.costo, n: 1, d: 2 }, { t: 'Precio', k: r => r.it.precio, n: 1, d: 2 }, { t: 'Valor al costo', k: r => Math.max(0, r.st.st) * r.it.costo, n: 1, d: 2 });
   const rows = invRows();
   return { title: S.invTab === 'producto' ? 'Inventario de productos para venta' : 'Inventario de insumos', sub: 'Existencias al ' + fmtDate(today()) + ' · ' + rows.length + ' artículos', cols, rows, foot: { 'Artículo': 'TOTAL', 'Existencia': rows.reduce((a, r) => a + r.st.st, 0), ...(costos ? { 'Valor al costo': rows.reduce((a, r) => a + Math.max(0, r.st.st) * r.it.costo, 0) } : {}) } };
 }
 EXPSRC.inv = invDS;
 function invTable() {
-  const rows = invRows(), costos = can('costos');
+  const rows = invRows(), costos = can('costos'), ins = S.invTab === 'insumo';
   if (!rows.length) return `<div class="empty"><b>Sin artículos</b>${S.invQ || S.invCat || S.invEst ? 'Prueba quitando los filtros.' : (can('catalogo') ? 'Pulsa «Nuevo artículo» para crear el primero.' : '')}</div>`;
-  const body = rows.map(({ it, st }) => `<tr${it.activo === false ? ' style="opacity:.5"' : ''}><td>${esc(it.codigo || '')}</td><td><b>${esc(it.nombre)}</b>${it.activo === false ? ' <small>(archivado)</small>' : ''}<br><small class="mut">${esc(catName(it.catId))}${it.ubicacion ? ' · ' + esc(it.ubicacion) : ''}</small></td>
-    <td class="r"><b>${fmtQty(st.st)}</b> <small class="mut">${esc(it.unidad)}</small></td><td class="r">${st.min || '—'}${it.min > 0 ? '' : st.min ? ' <small class="mut" title="Mínimo calculado según consumo">auto</small>' : ''}</td>
-    <td class="r">${fmtN(st.u.perDay, 1)}</td><td class="r">${st.cov === null ? '—' : fmtN(st.cov, 1) + ' d'}</td><td>${statusChip(st)}</td>
+  const origen = u => u.origen === 'estimado' ? ' <small class="mut" title="Estimado inicial: se reemplaza automáticamente con el consumo real">est.</small>' : u.origen === 'mixto' ? ' <small class="mut" title="Mezcla de estimado inicial y consumo real">mix</small>' : '';
+  const body = rows.map(({ it, st }) => { const un = ins ? unitState(it.id) : null; return `<tr${it.activo === false ? ' style="opacity:.5"' : ''}><td>${esc(it.codigo || '')}</td><td><b>${esc(it.nombre)}</b>${it.activo === false ? ' <small>(archivado)</small>' : ''}<br><small class="mut">${esc(catName(it.catId))}${it.ubicacion ? ' · ' + esc(it.ubicacion) : ''}</small></td>
+    <td class="r"><b>${fmtQty(st.st)}</b> <small class="mut">${esc(it.unidad)}</small>${st.camino ? `<br><small class="chip info" title="Solicitado y aún sin recibir">+${fmtQty(st.camino)} en camino</small>` : ''}</td>
+    ${ins ? `<td class="r">${fmtQty(un.sellado)}</td><td class="r">${fmtQty(un.uso)}</td>` : ''}<td class="r">${st.min || '—'}${it.min > 0 ? '' : st.min ? ' <small class="mut" title="Mínimo calculado según consumo">auto</small>' : ''}</td>
+    <td class="r">${fmtN(st.u.perDay, st.u.perDay < 1 ? 2 : 1)}${origen(st.u)}</td><td class="r">${st.cov === null ? '—' : fmtN(st.cov, 1) + ' d'}</td><td>${statusChip(st)}</td>
     ${costos ? `<td class="r">${it.costo ? fmtN(it.costo, 2) : '—'}</td>${S.invTab === 'producto' ? `<td class="r">${it.precio ? fmtN(it.precio, 2) : '—'}</td>` : ''}<td class="r">${it.costo ? fmtN(Math.max(0, st.st) * it.costo, 2) : '—'}</td>` : ''}
-    <td><div class="act">${can('mov') ? `<button class="btn sm icon-btn" title="Registrar ingreso" data-act="movFor" data-id="${it.id}" data-d="in">${ic('plus')}</button><button class="btn sm icon-btn" title="Registrar egreso" data-act="movFor" data-id="${it.id}" data-d="out" style="font-weight:900">−</button>` : ''}<button class="btn sm icon-btn" title="Historial y tiempo de uso" data-act="kardex" data-id="${it.id}">${ic('clock')}</button>${can('catalogo') ? `<button class="btn sm icon-btn" title="Editar" data-act="editItem" data-id="${it.id}">${ic('edit')}</button>` : ''}</div></td></tr>`).join('');
-  return `<div class="tw"><table><thead><tr><th>Código</th><th>Artículo</th><th class="r">Existencia</th><th class="r">Mínimo</th><th class="r">Consumo/día</th><th class="r">Cobertura</th><th>Estado</th>${costos ? `<th class="r">Costo</th>${S.invTab === 'producto' ? '<th class="r">Precio</th>' : ''}<th class="r">Valor</th>` : ''}<th></th></tr></thead><tbody>${body}</tbody></table></div>`;
+    <td><div class="act">${can('mov') ? `<button class="btn sm icon-btn" title="Registrar ingreso" data-act="movFor" data-id="${it.id}" data-d="in">${ic('plus')}</button>${ins ? `<button class="btn sm" title="Pasar una unidad de Sellado a En uso" data-act="unitOpen" data-id="${it.id}">Abrir</button><button class="btn sm" title="Dar una unidad por terminada (sale del inventario)" data-act="unitDone" data-id="${it.id}">Terminar</button>` : ''}<button class="btn sm icon-btn" title="Registrar egreso" data-act="movFor" data-id="${it.id}" data-d="out" style="font-weight:900">−</button>` : ''}<button class="btn sm icon-btn" title="Historial y tiempo de uso" data-act="kardex" data-id="${it.id}">${ic('clock')}</button>${can('catalogo') ? `<button class="btn sm icon-btn" title="Editar" data-act="editItem" data-id="${it.id}">${ic('edit')}</button>` : ''}</div></td></tr>`; }).join('');
+  return `<div class="tw"><table><thead><tr><th>Código</th><th>Artículo</th><th class="r">Existencia</th>${ins ? '<th class="r" title="Unidades nuevas, sin abrir">Sellado</th><th class="r" title="Unidades abiertas, en uso">En uso</th>' : ''}<th class="r">Mínimo</th><th class="r">Consumo/día</th><th class="r">Cobertura</th><th>Estado</th>${costos ? `<th class="r">Costo</th>${S.invTab === 'producto' ? '<th class="r">Precio</th>' : ''}<th class="r">Valor</th>` : ''}<th></th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 PAGES.inventario = {
   title: 'Inventario',
@@ -984,7 +1079,7 @@ ACT.newItem = () => openItem();
 ACT.editItem = el => openItem(el.dataset.id);
 
 function openItem(id) {
-  const it = id ? itemById(id) : { tipo: S.invTab, nombre: '', codigo: '', catId: '', unidad: 'unidad', pack: 0, min: 0, max: 0, costo: 0, precio: 0, provId: '', ubicacion: '', nota: '', duracionEsp: 0, activo: true };
+  const it = id ? itemById(id) : { tipo: S.invTab, nombre: '', codigo: '', catId: '', unidad: 'unidad', uCompra: '', pack: 0, min: 0, max: 0, costo: 0, precio: 0, provId: '', ubicacion: '', nota: '', duracionEsp: 0, baseDia: 0, activo: true };
   const costos = can('costos');
   openModal({
     title: id ? 'Editar artículo' : 'Nuevo artículo', size: 'mid',
@@ -1001,6 +1096,9 @@ function openItem(id) {
      <div class="grid g4">${costos ? `<div class="fld"><label>Costo unitario (${cfg().moneda})</label><input name="costo" type="number" min="0" step="any" value="${it.costo || ''}"></div><div class="fld only-prod"><label>Precio de venta (${cfg().moneda})</label><input name="precio" type="number" min="0" step="any" value="${it.precio || ''}"></div>` : ''}
       <div class="fld"><label>Proveedor habitual</label><select name="provId">${provOptions(it.provId)}</select></div>
       <div class="fld"><label>Ubicación</label><input name="ubicacion" value="${esc(it.ubicacion)}" placeholder="Bodega, recepción…"></div></div>
+     <div class="grid g3 only-ins"><div class="fld"><label>Se compra en (presentación)</label><input name="uCompra" value="${esc(it.uCompra || '')}" placeholder="Ej. tira de 50, caja, galón"></div>
+      <div class="fld"><label>Consumo mensual inicial (estimado)</label><input name="baseMes" type="number" min="0" step="any" value="${it.baseDia ? Math.round(it.baseDia * 30 * 10) / 10 : ''}" placeholder="Opcional"></div>
+      <div class="fld"><label>&nbsp;</label><small class="mut">Solo arranca el cálculo: el programa lo reemplaza solo con el consumo real que se vaya registrando.</small></div></div>
      <div class="grid g2"><div class="fld only-ins"><label>Duración esperada de 1 unidad (días)</label><input name="duracionEsp" type="number" min="0" step="any" value="${it.duracionEsp || ''}" placeholder="Opcional: para comparar con el uso real"></div>
       <div class="fld"><label>Notas</label><input name="nota" value="${esc(it.nota)}"></div></div>
      ${id ? `<label style="display:flex;gap:8px;align-items:center;font-weight:500"><input type="checkbox" name="activo" style="width:auto" ${it.activo !== false ? 'checked' : ''}> Artículo activo (desmarca para archivarlo)</label>`
@@ -1016,10 +1114,12 @@ SUB.item = async f => {
   const tipo = old ? old.tipo : g('tipo');
   if (ix().items.some(i => i.id !== id && i.tipo === tipo && norm(i.nombre) === norm(nombre))) return toast('Ya existe un artículo con ese nombre', 'bad');
   let catId = g('catId'); if (g('catNueva').trim()) catId = ensureCategory(g('catNueva').trim(), tipo);
-  const rec = { ...(old || { id: uid(), activo: true }), tipo, nombre, codigo: g('codigo').trim(), catId, unidad: g('unidad').trim() || 'unidad', pack: num(g('pack')), min: num(g('min')), max: num(g('max')), provId: g('provId'), ubicacion: g('ubicacion').trim(), nota: g('nota').trim(), duracionEsp: num(g('duracionEsp')) };
+  const rec = { ...(old || { id: uid(), activo: true }), tipo, nombre, codigo: g('codigo').trim(), catId, unidad: g('unidad').trim() || 'unidad', pack: num(g('pack')), min: num(g('min')), max: num(g('max')), provId: g('provId'), ubicacion: g('ubicacion').trim(), nota: g('nota').trim(), duracionEsp: num(g('duracionEsp')), uCompra: g('uCompra').trim(), baseDia: tipo === 'insumo' ? num(g('baseMes')) / 30 : 0 };
+  if (rec.baseDia && !rec.baseNota) rec.baseNota = 'Estimado capturado a mano';
   if (can('costos')) { rec.costo = num(g('costo')); rec.precio = tipo === 'producto' ? num(g('precio')) : 0; }
   else if (!old) { rec.costo = 0; rec.precio = 0; }
   if (old) rec.activo = f.elements.activo.checked;
+  if (!old && num(g('cantIni')) > 0) { const er = chkDate(g('fechaIni') || today(), { label: 'La fecha de la existencia inicial' }) || chkQty(num(g('cantIni')), 'La existencia inicial'); if (er) return toast(er, 'bad'); }
   put('items', rec);
   if (!old) {
     const q = num(g('cantIni'));
@@ -1041,15 +1141,26 @@ function kardexDS(id, from, to) {
   }
   return { title: 'Kardex · ' + it.nombre, sub: `Unidad: ${it.unidad} · ${from > '0000-01-01' ? fmtDate(from) + ' al ' + fmtDate(to) : 'historial completo'}`, cols: [{ t: 'Fecha', k: 'fecha' }, { t: 'Hora', k: 'hora' }, { t: 'Turno', k: 'turno' }, { t: 'Concepto', k: 'concepto' }, { t: 'Entrada', k: 'ent', n: 1 }, { t: 'Salida', k: 'sal', n: 1 }, { t: 'Saldo', k: 'saldo', n: 1 }, { t: 'Documento', k: 'doc' }, { t: 'Usuario', k: 'user' }, { t: 'Notas', k: 'nota' }], rows };
 }
+ACT.voidOpen = async el => {
+  const e = DB.movements.find(x => x.id === el.dataset.id); if (!e) return;
+  if (!await confirmBox('¿Anular esta apertura de unidad? La unidad volverá a contarse como Sellado.', 'Anular', true)) return;
+  del('movements', e.id); log('Anular apertura', itemById(e.itemId)?.nombre || ''); toast('Apertura anulada'); closeModal(); render();
+};
 ACT.kardex = el => {
   const it = itemById(el.dataset.id); S.kardexId = it.id; const s = itemStatus(it), lf = lotsOf(it.id);
   const lotRows = lf.lots.slice().reverse().slice(0, 12).map(l => `<tr><td>${fmtDate(l.fecha)}</td><td>${l.tipo === 'inicial' ? 'Existencia inicial' : TIPO_LABEL[l.tipo] || 'Ingreso'}</td><td class="r">${fmtQty(l.cant)}</td><td>${l.cierre ? fmtDate(l.cierre) : '<span class="chip info">en uso: ' + fmtQty(l.rest) + ' restantes</span>'}</td><td class="r">${l.dias ? l.dias + ' d' : l.cierre ? '1 d' : daysBetween(l.fecha, today()) + ' d (en curso)'}</td><td>${l.vence ? fmtDate(l.vence) : ''}</td></tr>`).join('');
   const ds = kardexDS(it.id, '0000-01-01', '9999-12-31');
   const stat = (l, v) => `<div class="kpi" style="padding:10px 12px"><small>${l}</small><b style="font-size:19px">${v}</b></div>`;
+  const ins = it.tipo === 'insumo', un = unitState(it.id), uc = unitCycles(it.id), lt = leadTimes().per.get(it.id);
+  const durU = uc.avg !== null ? (it.duracionEsp > 0 ? `${fmtN(uc.avg, 1)} d real vs ${fmtN(it.duracionEsp, 0)} d esperado` : fmtN(uc.avg, 1) + ' días') : '—';
+  const ucRows = [...uc.enUso.map(o => `<tr><td>${fmtDate(o.abrio)}</td><td><span class="chip info">En uso${o.cant > 1 ? ' ×' + fmtQty(o.cant) : ''}</span></td><td class="r">${o.dias} d (en curso)</td><td>${can('anular') ? `<button class="btn sm icon-btn" title="Anular esta apertura" data-act="voidOpen" data-id="${o.evId}">${ic('trash')}</button>` : ''}</td></tr>`),
+    ...uc.cyc.slice().reverse().slice(0, 10).map(c => `<tr><td>${fmtDate(c.abrio)}</td><td>${fmtDate(c.termino)}</td><td class="r">${c.dias} d</td><td></td></tr>`)].join('');
   const dur = it.duracionEsp > 0 && lf.avgLife ? `${fmtN(lf.avgLife, 0)} d real vs ${fmtN(it.duracionEsp, 0)} d esperado` : (lf.avgLife ? fmtN(lf.avgLife, 0) + ' días' : '—');
   openModal({
     title: `${esc(it.nombre)} <span style="margin-left:8px">${statusChip(s)}</span>`, size: 'wide',
-    body: `<div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">${stat('Existencia', fmtQty(s.st) + ' ' + esc(it.unidad))}${stat('Consumo / día', fmtN(s.u.perDay, 2))}${stat('Cobertura', s.cov === null ? '—' : fmtN(s.cov, 1) + ' días')}${stat('Se agota aprox.', s.agot ? fmtDate(s.agot) : '—')}${stat('Vida prom. de un lote', dur)}${stat('Cada cuánto se repone', lf.cicloRepo ? fmtN(lf.cicloRepo, 0) + ' días' : '—')}</div>
+    body: `<div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">${stat('Existencia', fmtQty(s.st) + ' ' + esc(it.unidad))}${stat('Consumo / día', fmtN(s.u.perDay, 2))}${stat('Cobertura', s.cov === null ? '—' : fmtN(s.cov, 1) + ' días')}${stat('Se agota aprox.', s.agot ? fmtDate(s.agot) : '—')}${stat('Vida prom. de un lote', dur)}${stat('Cada cuánto se repone', lf.cicloRepo ? fmtN(lf.cicloRepo, 0) + ' días' : '—')}${ins ? stat('Sellado / En uso', fmtQty(un.sellado) + ' / ' + fmtQty(un.uso)) + stat('Duración de 1 unidad', durU) : ''}${lt && lt.avg !== null ? stat('Tiempo de entrega', fmtN(lt.avg, 1) + ' días') : ''}${s.camino ? stat('En camino', fmtQty(s.camino) + ' ' + esc(it.unidad)) : ''}</div>
+    <p class="mut" style="margin:6px 0 10px"><small>Consumo/día: <b>${esc(s.u.origen)}</b>${s.u.origen === 'estimado' || s.u.origen === 'mixto' ? ` · base inicial ${fmtN(s.u.base * 30, 1)} por mes${it.baseNota ? ' (' + esc(it.baseNota) + ')' : ''}; se ajusta solo con el uso real` : ''}</small></p>
+    ${ins ? `<h4 class="mb">Unidades: de Sellado a Terminado <small class="mut">(cuántos días dura cada una)</small></h4><div class="tw mb"><table><thead><tr><th>Se abrió</th><th>Se terminó</th><th class="r">Duró</th><th></th></tr></thead><tbody>${ucRows || '<tr><td colspan="4" class="empty">Aún no hay unidades abiertas. Usa «Abrir» y «Terminar» en Inventario para medir cuánto dura cada una.</td></tr>'}</tbody></table></div>` : ''}
     <h4 class="mb">Lotes de ingreso y cuánto duraron <small class="mut">(método PEPS: lo primero que entra es lo primero que sale)</small></h4>
     <div class="tw mb"><table><thead><tr><th>Ingresó</th><th>Origen</th><th class="r">Cantidad</th><th>Se agotó</th><th class="r">Duración</th><th>Vence</th></tr></thead><tbody>${lotRows || '<tr><td colspan="6" class="empty">Sin ingresos registrados</td></tr>'}</tbody></table></div>
     <div class="row mb"><h4 class="sp">Historial de movimientos</h4>${expBtns('kardexItem')}</div>${dsTable({ ...ds, rows: ds.rows.slice().reverse().slice(0, 150) }, { maxh: '300px' })}`,
@@ -1081,7 +1192,7 @@ function movTable() {
   const body = shown.map(m => `<tr><td>${fmtDate(m.fecha)}<br><small class="mut">${esc(m.hora || '')} ${esc(m.turno || '')}</small></td><td><b>${esc(itemById(m.itemId).nombre)}</b></td>
     <td><span class="${m.dir === 'in' ? 'in-chip' : 'out-chip'}">${m.dir === 'in' ? '▲' : '▼'}</span> ${esc(TIPO_LABEL[m.tipo])}</td><td class="r"><b class="${m.dir === 'in' ? 'in-chip' : 'out-chip'}">${m.dir === 'in' ? '+' : '−'}${fmtQty(m.cant)}</b></td>
     <td>${esc(m.doc || '')}${m.provId ? '<br><small class="mut">' + esc(provName(m.provId)) + '</small>' : ''}</td><td>${esc(userName(m.userId))}</td><td style="max-width:260px"><small>${esc(m.nota || '')}</small></td>
-    <td><div class="act">${can('mov') && !m.src?.startsWith('turno') && m.src !== 'conteo' ? `<button class="btn sm icon-btn" title="Editar" data-act="editMov" data-id="${m.id}">${ic('edit')}</button>` : ''}${can('anular') ? `<button class="btn sm icon-btn" title="Anular" data-act="voidMov" data-id="${m.id}">${ic('trash')}</button>` : ''}</div></td></tr>`).join('');
+    <td><div class="act">${can('mov') && !m.src?.startsWith('turno') && m.src !== 'conteo' && m.src !== 'terminar' ? `<button class="btn sm icon-btn" title="Editar" data-act="editMov" data-id="${m.id}">${ic('edit')}</button>` : ''}${can('anular') ? `<button class="btn sm icon-btn" title="Anular" data-act="voidMov" data-id="${m.id}">${ic('trash')}</button>` : ''}</div></td></tr>`).join('');
   const ing = ds.foot.Entrada, egr = ds.foot.Salida;
   return `<div class="row mb"><span class="chip ok">Entradas: +${fmtQty(ing)}</span><span class="chip bad">Salidas: −${fmtQty(egr)}</span><span class="chip mut">Neto: ${fmtQty(ing - egr)}</span><small class="mut">${ds.rows.length} movimientos</small></div>
   <div class="tw"><table><thead><tr><th>Fecha</th><th>Artículo</th><th>Concepto</th><th class="r">Cantidad</th><th>Documento</th><th>Usuario</th><th>Notas</th><th></th></tr></thead><tbody>${body}</tbody></table></div>
@@ -1146,8 +1257,11 @@ CHG.movitem = el => {
 SUB.mov = async (f, e) => {
   const g = n => f.elements[n]?.value ?? '', dir = f.dataset.dir, tipo = g('tipo'), editId = g('editId');
   const lines = $$('.ml', f).map(tr => ({ itemId: tr.querySelector('[name=itemId]').value, cant: num(tr.querySelector('[name=cant]').value), costo: num(tr.querySelector('[name=costo]')?.value), precio: num(tr.querySelector('[name=precio]')?.value), vence: tr.querySelector('[name=vence]')?.value || '' })).filter(l => l.itemId || l.cant);
-  if (!g('fecha')) return toast('Indica la fecha', 'bad');
+  { const er = chkDate(g('fecha'), { label: 'La fecha del movimiento' }); if (er) return toast(er, 'bad'); }
   if (!lines.length || lines.some(l => !l.itemId || !(l.cant > 0))) return toast('Cada línea necesita un artículo y una cantidad mayor a 0', 'bad');
+  { const er = lines.map(l => chkQty(l.cant, 'La cantidad de ' + (itemById(l.itemId)?.nombre || 'un artículo'))).find(Boolean); if (er) return toast(er, 'bad'); }
+  { const v = lines.find(l => l.vence && dir === 'in' && l.vence < g('fecha')); if (v) return toast(`La fecha de vencimiento de ${itemById(v.itemId).nombre} es anterior a la del ingreso.`, 'bad'); }
+  { const dup = lines.find((l, i) => lines.findIndex(x => x.itemId === l.itemId) !== i); if (dup && !await confirmBox(`<b>${esc(itemById(dup.itemId).nombre)}</b> aparece más de una vez en esta ficha. ¿Registrar ambas líneas?`, 'Registrar igual')) return; }
   if (dir === 'out') { // validar existencias
     const need = {}; lines.forEach(l => need[l.itemId] = (need[l.itemId] || 0) + l.cant);
     const bad = Object.entries(need).filter(([id, q]) => stockOf(id) + (editId ? (DB.movements.find(m => m.id === editId)?.itemId === id ? DB.movements.find(m => m.id === editId).cant : 0) : 0) < q);
@@ -1290,22 +1404,24 @@ ACT.cntView = el => {
 
 /* ---------------------------- SOLICITUDES ---------------------------- */
 S.reqF = '';
+const nextFolio = () => 'SOL-' + String(1 + Math.max(0, ...DB.requests.filter(r => /^SOL-/.test(r.folio || '')).map(r => parseInt((r.folio || '').replace(/\D/g, '')) || 0))).padStart(4, '0');
 const REQ_ST = { Borrador: 'mut', Enviada: 'info', Parcial: 'warn', Recibida: 'ok', Cancelada: 'bad' };
 PAGES.solicitudes = {
   title: 'Solicitudes de insumos y productos',
   html() {
     const all = L('requests').sort((a, b) => b.fecha.localeCompare(a.fecha) || b.u - a.u), rows = all.filter(r => !S.reqF || r.estado === S.reqF);
-    const body = rows.map(r => `<tr><td><b>${esc(r.folio)}</b></td><td>${fmtDate(r.fecha)}</td><td>${r.tipo === 'insumo' ? 'Insumos' : 'Productos para venta'}</td><td>${esc(r.destNombre || '—')}</td><td class="r">${r.lines.length}</td><td>${r.urgencia === 'Urgente' ? '<span class="chip bad">Urgente</span>' : 'Normal'}</td><td>${chip(r.estado, REQ_ST[r.estado])}${r.via ? ` <small class="mut">${r.via === 'wa' ? 'WhatsApp' : 'correo'}</small>` : ''}</td><td>${esc(r.solicitante || '')}</td><td><div class="act"><button class="btn sm" data-act="reqOpen" data-id="${r.id}">Ver / enviar</button></div></td></tr>`).join('');
+    const body = rows.map(r => { const act = reqActive(r), dias = reqWaitDays(r), tarde = act && dias > (cfg().diasEspera || 7), ok = r.lines.filter(l => l.recFecha), ent = ok.length ? ok.reduce((a, l) => a + Math.max(0, daysBetween(r.fecha, l.recFecha)), 0) / ok.length : null;
+      return `<tr><td><b>${esc(r.folio)}</b>${r.hist ? ' <small class="chip mut">histórico</small>' : ''}</td><td>${fmtDate(r.fecha)}</td><td>${r.tipo === 'insumo' ? 'Insumos' : 'Productos para venta'}</td><td>${esc(r.destNombre || '—')}</td><td class="r">${r.lines.length}</td><td>${r.urgencia === 'Urgente' ? '<span class="chip bad">Urgente</span>' : 'Normal'}</td><td>${chip(r.estado, REQ_ST[r.estado])}${r.via ? ` <small class="mut">${r.via === 'wa' ? 'WhatsApp' : 'correo'}</small>` : ''}</td><td>${act ? (tarde ? chip(dias + ' d · tarde', 'bad') : chip(dias + ' d esperando', 'info')) : ent !== null ? `<small>entrega prom. ${fmtN(ent, 1)} d</small>` : ''}</td><td>${esc(r.solicitante || '')}</td><td><div class="act"><button class="btn sm" data-act="reqOpen" data-id="${r.id}">Ver / enviar</button></div></td></tr>`; }).join('');
     return `<div class="tools"><div class="seg">${['', 'Borrador', 'Enviada', 'Parcial', 'Recibida', 'Cancelada'].map(e => `<button data-act="reqfilter" data-v="${e}" class="${S.reqF === e ? 'on' : ''}">${e || 'Todas'}</button>`).join('')}</div><span class="sp"></span>
      ${can('solicitud') ? `<button class="btn" data-act="reqNew" data-t="insumo">${ic('plus')} Solicitud de insumos</button><button class="btn pri" data-act="reqNew" data-t="producto">${ic('plus')} Solicitud de productos para venta</button>` : ''}</div>
-    ${rows.length ? `<div class="tw"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Tipo</th><th>Para</th><th class="r">Líneas</th><th>Urgencia</th><th>Estado</th><th>Solicitante</th><th></th></tr></thead><tbody>${body}</tbody></table></div>` : `<div class="card empty"><b>Sin solicitudes</b>Crea una solicitud y envíala por WhatsApp o correo al proveedor o a la gerencia. También puedes generarla desde las alertas del Tablero.</div>`}`;
+    ${rows.length ? `<div class="tw"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Tipo</th><th>Para</th><th class="r">Líneas</th><th>Urgencia</th><th>Estado</th><th>Espera / entrega</th><th>Solicitante</th><th></th></tr></thead><tbody>${body}</tbody></table></div>` : `<div class="card empty"><b>Sin solicitudes</b>Crea una solicitud y envíala por WhatsApp o correo al proveedor o a la gerencia. También puedes generarla desde las alertas del Tablero.</div>`}`;
   },
 };
 ACT.reqfilter = el => { S.reqF = el.dataset.v; render(); };
 ACT.reqNew = el => openRequestForm({ tipo: el.dataset.t });
 function reqLine(l = {}, tipo) {
   const it = l.itemId ? itemById(l.itemId) : null;
-  return `<tr class="rl"><td><select name="itemId" data-change="reqitem">${itemOptions(l.itemId, tipo)}</select><span class="ex">${it ? 'Existencia: ' + fmtQty(stockOf(it.id)) + ' ' + esc(it.unidad) : ''}</span></td><td class="r"><input class="q" name="cant" type="number" min="0" step="any" value="${l.cant ?? ''}"></td><td><button type="button" class="btn ghost icon-btn" data-act="rlrem">${ic('x')}</button></td></tr>`;
+  return `<tr class="rl"><td><select name="itemId" data-change="reqitem">${itemOptions(l.itemId, tipo)}</select><span class="ex">${it ? 'Existencia: ' + fmtQty(stockOf(it.id)) + ' ' + esc(it.unidad) + (onOrder(it.id) ? ' · en camino: ' + fmtQty(onOrder(it.id)) : '') + (it.pack > 0 ? ` · se compra ${esc(it.uCompra || 'paquete')} de ${fmtQty(it.pack)}` : '') : ''}</span></td><td class="r"><input class="q" name="cant" type="number" min="0" step="any" value="${l.cant ?? ''}"></td><td><button type="button" class="btn ghost icon-btn" data-act="rlrem">${ic('x')}</button></td></tr>`;
 }
 function openRequestForm({ tipo = 'producto', fromAlerts = false, id } = {}) {
   const r = id ? DB.requests.find(x => x.id === id) : null; tipo = r?.tipo || tipo;
@@ -1326,7 +1442,7 @@ function openRequestForm({ tipo = 'producto', fromAlerts = false, id } = {}) {
   });
 }
 CHG.reqprov = el => { const p = ix().provs.get(el.value), f = el.form; if (p) { f.elements.destNombre.value = p.nombre; f.elements.destTel.value = p.tel || ''; f.elements.destEmail.value = p.email || ''; } };
-CHG.reqitem = el => { const it = itemById(el.value), ex = el.closest('tr').querySelector('.ex'); ex.textContent = it ? `Existencia: ${fmtQty(stockOf(it.id))} ${it.unidad}` : ''; if (it && !el.closest('tr').querySelector('[name=cant]').value) { const s = itemStatus(it), q = suggestQty(it, s) || it.pack; if (q) el.closest('tr').querySelector('[name=cant]').value = q; } };
+CHG.reqitem = el => { const it = itemById(el.value), ex = el.closest('tr').querySelector('.ex'); ex.textContent = it ? `Existencia: ${fmtQty(stockOf(it.id))} ${it.unidad}${onOrder(it.id) ? ' · en camino: ' + fmtQty(onOrder(it.id)) : ''}${it.pack > 0 ? ` · se compra ${it.uCompra || 'paquete'} de ${fmtQty(it.pack)}` : ''}` : ''; if (it && !el.closest('tr').querySelector('[name=cant]').value) { const s = itemStatus(it), q = suggestQty(it, s) || it.pack; if (q) el.closest('tr').querySelector('[name=cant]').value = q; } };
 ACT.rladd = () => { $('#rlines').insertAdjacentHTML('beforeend', reqLine({}, $('#reqform').dataset.tipo)); };
 ACT.rlrem = el => { if ($$('#rlines .rl').length > 1) el.closest('tr').remove(); };
 ACT.reqSuggest = () => {
@@ -1337,12 +1453,16 @@ ACT.reqSuggest = () => {
 };
 SUB.req = f => {
   const g = n => f.elements[n]?.value ?? '', id = g('id'), tipo = f.dataset.tipo;
-  const lines = $$('.rl', f).map(tr => ({ itemId: tr.querySelector('[name=itemId]').value, cant: num(tr.querySelector('[name=cant]').value) })).filter(l => l.itemId && l.cant > 0);
+  let lines = $$('.rl', f).map(tr => ({ itemId: tr.querySelector('[name=itemId]').value, cant: num(tr.querySelector('[name=cant]').value) })).filter(l => l.itemId && l.cant > 0);
   if (!lines.length) return toast('Agrega al menos un artículo con cantidad', 'bad');
+  { const er = chkDate(g('fecha') || today(), { label: 'La fecha de la solicitud' }) || (g('fechaReq') ? chkDate(g('fechaReq'), { label: 'La fecha requerida', min: g('fecha') || today(), max: '' }) : '') || lines.map(l => chkQty(l.cant, 'La cantidad de ' + itemById(l.itemId).nombre)).find(Boolean); if (er) return toast(er, 'bad'); }
+  const merged = new Map(); lines.forEach(l => merged.set(l.itemId, (merged.get(l.itemId) || 0) + l.cant)); // un artículo repetido se suma en una sola línea
+  const dups = lines.length - merged.size; lines = [...merged].map(([itemId, cant]) => ({ itemId, cant }));
   const old = id ? DB.requests.find(x => x.id === id) : null;
-  const folio = old?.folio || 'SOL-' + String(1 + Math.max(0, ...DB.requests.map(r => parseInt((r.folio || '').replace(/\D/g, '')) || 0))).padStart(4, '0');
-  const rec = { ...(old || { id: uid(), estado: 'Borrador', userId: S.user.id }), folio, fecha: g('fecha') || today(), tipo, solicitante: g('solicitante'), urgencia: g('urgencia'), provId: g('provId'), destNombre: g('destNombre'), destTel: g('destTel'), destEmail: g('destEmail'), fechaReq: g('fechaReq'), nota: g('nota'), lines: lines.map(l => { const it = itemById(l.itemId); return { itemId: it.id, nombre: it.nombre, unidad: it.unidad, cant: l.cant, stock: stockOf(it.id) }; }) };
-  put('requests', rec); log(old ? 'Editar solicitud' : 'Crear solicitud', folio); closeModal(); render(); openRequest(rec.id);
+  const folio = old?.folio || nextFolio();
+  const prev = new Map((old?.lines || []).map(l => [l.itemId, l]));
+  const rec = { ...(old || { id: uid(), estado: 'Borrador', userId: S.user.id }), folio, fecha: g('fecha') || today(), tipo, solicitante: g('solicitante'), urgencia: g('urgencia'), provId: g('provId'), destNombre: g('destNombre'), destTel: g('destTel'), destEmail: g('destEmail'), fechaReq: g('fechaReq'), nota: g('nota'), lines: lines.map(l => { const it = itemById(l.itemId), p = prev.get(l.itemId) || {}; return { ...p, itemId: it.id, nombre: it.nombre, unidad: it.unidad, cant: l.cant, stock: stockOf(it.id) }; }) };
+  put('requests', rec); log(old ? 'Editar solicitud' : 'Crear solicitud', folio); if (dups) toast(`${dups} línea(s) repetida(s) se sumaron en una sola`); closeModal(); render(); openRequest(rec.id);
 };
 function openRequest(id) {
   const r = DB.requests.find(x => x.id === id); if (!r) return; S.reqId = id; EXPSRC.req = () => requestDS(r);
@@ -1352,6 +1472,7 @@ function openRequest(id) {
     title: `${esc(r.folio)} ${chip(r.estado, REQ_ST[r.estado])}`, size: 'mid',
     body: `<div class="row mb"><span class="mut sp">${r.tipo === 'insumo' ? 'Insumos' : 'Productos para venta'} · ${fmtDate(r.fecha)} · ${esc(r.destNombre || 'sin destinatario')}${r.destTel ? ' · WhatsApp ' + esc(r.destTel) : ''}${r.destEmail ? ' · ' + esc(r.destEmail) : ''}</span></div>
      <div class="tabs"><button class="on" data-act="reqfmt" data-f="wa">Mensaje WhatsApp</button><button data-act="reqfmt" data-f="mail">Mensaje de correo</button></div>
+     ${r.estado !== 'Borrador' ? reqLinesStatus(r) : ''}
      <div class="msgbox" id="reqmsg">${esc(requestMessage(r, 'wa'))}</div>
      ${!r.destTel && !cfg().waDefault ? '<small class="mut">Sin número de WhatsApp: se abrirá WhatsApp para que elijas el contacto.</small>' : ''}
      <div class="row mt"><a class="btn wa" href="${waLink(r)}" target="_blank" rel="noopener" data-sent="wa" data-rid="${r.id}">${ic('wa')} Enviar por WhatsApp</a>
@@ -1361,9 +1482,15 @@ function openRequest(id) {
       <button class="btn" data-act="reqCopy">${ic('copy')} Copiar</button></div>
      <div class="row mt">${expBtns('req')}</div>
      <small class="mut" style="display:block;margin-top:8px">Al enviar, WhatsApp o tu correo se abren con el mensaje listo; solo confirma el envío allí. Si el correo es largo y tu programa lo corta, usa «Copiar».</small>`,
-    foot: `${can('solicitud') && !cerrada ? `<button class="btn danger" data-act="reqCancel" data-id="${r.id}" style="margin-right:auto">Cancelar solicitud</button>` : ''}${can('solicitud') && r.estado === 'Borrador' ? `<button class="btn" data-act="reqEdit" data-id="${r.id}">${ic('edit')} Editar</button>` : ''}${can('mov') && !cerrada ? `<button class="btn pri" data-act="reqReceive" data-id="${r.id}">${ic('box2')} Registrar recepción</button>` : ''}<button class="btn" data-act="mclose">Cerrar</button>`,
+    foot: `${can('solicitud') && !cerrada ? `<button class="btn danger" data-act="reqCancel" data-id="${r.id}" style="margin-right:auto">Cancelar solicitud</button>` : ''}${can('solicitud') && r.estado === 'Borrador' ? `<button class="btn" data-act="reqEdit" data-id="${r.id}">${ic('edit')} Editar</button><button class="btn" data-act="reqSent" data-id="${r.id}" title="Si ya la enviaste por otro medio">Marcar como enviada</button>` : ''}${can('mov') && !cerrada && !r.hist ? `<button class="btn pri" data-act="reqReceive" data-id="${r.id}">${ic('box2')} Registrar recepción</button>` : ''}<button class="btn" data-act="mclose">Cerrar</button>`,
   });
 }
+function reqLinesStatus(r) {
+  const rows = r.lines.map(l => { const rec = l.recCant || 0, pend = Math.max(0, l.cant - rec), d = l.recFecha ? Math.max(0, daysBetween(r.fecha, l.recFecha)) : null;
+    return `<tr><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r">${fmtQty(rec)}</td><td>${l.recFecha ? fmtDate(l.recFecha) : '—'}</td><td class="r">${d !== null ? d + ' d' : ''}</td><td>${l.cerrada ? chip('cerrada', 'mut') : pend > 0 ? chip('pendiente ' + fmtQty(pend), r.hist ? 'mut' : 'warn') : chip('completa', 'ok')}</td></tr>`; }).join('');
+  return `<div class="tw mb" style="max-height:220px"><table><thead><tr><th>Artículo</th><th class="r">Pedido</th><th class="r">Recibido</th><th>Fecha recepción</th><th class="r">Entrega</th><th>Estado</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+ACT.reqSent = el => { const r = DB.requests.find(x => x.id === el.dataset.id); put('requests', { ...r, estado: 'Enviada', via: r.via || 'otro', enviada: Date.now() }); log('Enviar solicitud', r.folio + ' (marcada como enviada)'); closeModal(); render(); toast('Marcada como enviada', 'ok'); };
 ACT.reqOpen = el => openRequest(el.dataset.id);
 ACT.reqEdit = el => { closeModal(); openRequestForm({ id: el.dataset.id }); };
 ACT.reqfmt = el => { const r = DB.requests.find(x => x.id === S.reqId); $$('.tabs button', el.parentNode).forEach(b => b.classList.toggle('on', b === el)); $('#reqmsg').textContent = requestMessage(r, el.dataset.f); };
@@ -1377,20 +1504,31 @@ ACT.reqReceive = el => {
   const r = DB.requests.find(x => x.id === el.dataset.id), costos = can('costos');
   openModal({
     title: 'Registrar recepción · ' + esc(r.folio), size: 'mid',
-    body: `<form id="recform" data-submit="rec" data-id="${r.id}"><div class="grid g3"><div class="fld"><label>Fecha de recepción</label><input type="date" name="fecha" value="${today()}" max="${today()}"></div><div class="fld"><label>Documento / factura</label><input name="doc"></div><div class="fld"><label>Proveedor</label><select name="provId">${provOptions(r.provId)}</select></div></div>
-    <div class="tw"><table class="lines"><thead><tr><th>Artículo</th><th class="r">Solicitado</th><th class="r">Recibido</th>${costos ? '<th class="r">Costo unit.</th>' : ''}</tr></thead><tbody>${r.lines.map(l => `<tr data-id="${l.itemId}"><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r"><input class="q" name="rec" type="number" min="0" step="any" value="${l.cant}"></td>${costos ? `<td class="r"><input class="q" name="costo" type="number" min="0" step="any" value="${itemById(l.itemId)?.costo || ''}"></td>` : ''}</tr>`).join('')}</tbody></table></div>
-    <small class="mut">Se crearán los ingresos en el inventario con la fecha indicada.</small>
+    body: `<form id="recform" data-submit="rec" data-id="${r.id}"><div class="grid g3"><div class="fld"><label>Fecha de recepción</label><input type="date" name="fecha" value="${today()}" min="${r.fecha}" max="${today()}"></div><div class="fld"><label>Documento / factura</label><input name="doc"></div><div class="fld"><label>Proveedor</label><select name="provId">${provOptions(r.provId)}</select></div></div>
+    <div class="tw"><table class="lines"><thead><tr><th>Artículo</th><th class="r">Pedido</th><th class="r">Ya recibido</th><th class="r">Recibido hoy</th>${costos ? '<th class="r">Costo unit.</th>' : ''}<th title="Marca si lo que falta ya no llegará">Cerrar lo pendiente</th></tr></thead><tbody>${r.lines.map(l => { const pend = Math.max(0, l.cant - (l.recCant || 0)); return `<tr data-id="${l.itemId}"><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r">${fmtQty(l.recCant || 0)}</td><td class="r"><input class="q" name="rec" type="number" min="0" step="any" value="${l.cerrada ? 0 : pend}"</td>${costos ? `<td class="r"><input class="q" name="costo" type="number" min="0" step="any" value="${itemById(l.itemId)?.costo || ''}"></td>` : ''}<td style="text-align:center"><input type="checkbox" name="cerrar" style="width:auto" ${l.cerrada ? 'checked' : ''}></td></tr>`; }).join('')}</tbody></table></div>
+    <small class="mut">Se crearán los ingresos en el inventario con la fecha indicada y quedará registrado cuántos días tardó cada artículo.</small>
     <div class="mf" style="padding:12px 0 0;border:0"><button type="button" class="btn" data-act="mclose">Cancelar</button><button class="btn pri">Registrar ingreso</button></div></form>`,
   });
 };
 SUB.rec = f => {
-  const r = DB.requests.find(x => x.id === f.dataset.id); let full = true, n = 0;
-  $$('tbody tr', f).forEach(tr => {
-    const q = num(tr.querySelector('[name=rec]').value), l = r.lines.find(x => x.itemId === tr.dataset.id), it = itemById(tr.dataset.id);
-    if (q < l.cant) full = false; if (q > 0 && it) { const c = num(tr.querySelector('[name=costo]')?.value) || it.costo; put('movements', mkMove({ itemId: it.id, dir: 'in', tipo: 'compra', cant: q, fecha: f.elements.fecha.value, doc: f.elements.doc.value || r.folio, provId: f.elements.provId.value, reqId: r.id, src: 'solicitud', costoU: c, nota: 'Recepción de ' + r.folio })); if (c > 0 && c !== it.costo && can('costos')) put('items', { ...it, costo: c }); n++; }
-  });
-  put('requests', { ...r, estado: full ? 'Recibida' : 'Parcial', recibida: f.elements.fecha.value }); log('Recepción de solicitud', `${r.folio} · ${n} artículos`);
-  closeModal(); toast('Ingreso registrado en el inventario', 'ok'); render();
+  const r = DB.requests.find(x => x.id === f.dataset.id), fecha = f.elements.fecha.value;
+  { const er = chkDate(fecha, { label: 'La fecha de recepción', min: r.fecha }); if (er) return toast(er, 'bad'); }
+  const rows = $$('tbody tr', f).map(tr => ({ tr, l: r.lines.find(x => x.itemId === tr.dataset.id), it: itemById(tr.dataset.id), q: num(tr.querySelector('[name=rec]').value), cerrar: tr.querySelector('[name=cerrar]').checked }));
+  { const er = rows.filter(x => x.q > 0).map(x => chkQty(x.q, 'La cantidad recibida de ' + x.l.nombre)).find(Boolean); if (er) return toast(er, 'bad'); }
+  const exceso = rows.find(x => x.q > 0 && (x.l.recCant || 0) + x.q > x.l.cant * 1.5 + 1e-9);
+  if (!rows.some(x => x.q > 0) && !rows.some(x => x.cerrar && !x.l.cerrada)) return toast('Escribe al menos una cantidad recibida', 'bad');
+  const go = () => {
+    let n = 0;
+    const lines = r.lines.map(l => { const x = rows.find(y => y.l === l); if (!x) return l; const nl = { ...l };
+      if (x.q > 0) { nl.recCant = (l.recCant || 0) + x.q; nl.recFecha = fecha; }
+      nl.cerrada = x.cerrar && nl.cant > (nl.recCant || 0); return nl; });
+    rows.forEach(x => { if (x.q > 0 && x.it) { const c = num(x.tr.querySelector('[name=costo]')?.value) || x.it.costo; put('movements', mkMove({ itemId: x.it.id, dir: 'in', tipo: 'compra', cant: x.q, fecha, doc: f.elements.doc.value || r.folio, provId: f.elements.provId.value, reqId: r.id, src: 'solicitud', costoU: c, nota: 'Recepción de ' + r.folio })); if (c > 0 && c !== x.it.costo && can('costos')) put('items', { ...x.it, costo: c }); n++; } });
+    const full = lines.every(l => (l.recCant || 0) >= l.cant || l.cerrada);
+    put('requests', { ...r, lines, estado: full ? 'Recibida' : 'Parcial', recibida: fecha }); log('Recepción de solicitud', `${r.folio} · ${n} artículos`);
+    closeModal(); toast('Ingreso registrado en el inventario', 'ok'); render();
+  };
+  if (exceso) return confirmBox(`Recibes bastante más de lo pedido de <b>${esc(exceso.l.nombre)}</b> (pedido ${fmtQty(exceso.l.cant)}, recibido ${fmtQty((exceso.l.recCant || 0) + exceso.q)}). ¿Es correcto?`, 'Sí, registrar').then(ok => ok && go());
+  go();
 };
 
 /* ---------------------------- REPORTES ---------------------------- */
@@ -1434,15 +1572,23 @@ const REP = {
     build() {
       const { from, to } = periodRange(); const hasta = to > today() ? today() : to, dias = Math.max(1, daysBetween(from, hasta) + 1);
       const rows = repItems().map(it => { const s = summarize(it.id, from, to), st = itemStatus(it), lf = lotsOf(it.id); return { it, s, st, lf }; });
-      const cols = [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Consumo en el periodo', k: r => r.s.consumo, n: 1 }, { t: 'Promedio por día (periodo)', k: r => r.s.consumo / dias, n: 1, d: 2 }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Se agota aprox.', k: r => r.st.agot ? fmtDate(r.st.agot) : '' }, { t: 'Vida prom. de un lote (días)', k: r => r.lf.avgLife ?? '', n: 1, d: 0 }, { t: 'Se repone cada (días)', k: r => r.lf.cicloRepo ?? '', n: 1, d: 0 }, { t: 'Duración esperada (días)', k: r => r.it.duracionEsp || '', n: 1, d: 0 }, { t: 'Estado', k: r => r.st.est }];
+      const cols = [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Consumo en el periodo', k: r => r.s.consumo, n: 1 }, { t: 'Promedio por día (periodo)', k: r => r.s.consumo / dias, n: 1, d: 2 }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Origen del consumo', k: r => r.st.u.origen }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Se agota aprox.', k: r => r.st.agot ? fmtDate(r.st.agot) : '' }, { t: 'Sellado', k: r => r.it.tipo === 'insumo' ? unitState(r.it.id).sellado : '', n: 1 }, { t: 'En uso', k: r => r.it.tipo === 'insumo' ? unitState(r.it.id).uso : '', n: 1 }, { t: 'Duración de 1 unidad (días)', k: r => r.it.tipo === 'insumo' ? unitCycles(r.it.id).avg ?? '' : '', n: 1, d: 1 }, { t: 'Vida prom. de un lote (días)', k: r => r.lf.avgLife ?? '', n: 1, d: 0 }, { t: 'Se repone cada (días)', k: r => r.lf.cicloRepo ?? '', n: 1, d: 0 }, { t: 'Duración esperada (días)', k: r => r.it.duracionEsp || '', n: 1, d: 0 }, { t: 'Estado', k: r => r.st.est }];
       return { title: 'Consumo y tiempo de uso', sub: `${periodLabel()} · cobertura calculada con el consumo de los últimos ${cfg().ventanaConsumo} días · vida de lote por método PEPS`, cols, rows };
+    },
+  },
+  entregas: {
+    n: 'Tiempos de entrega', d: 'Cuántos días tarda cada artículo desde que se solicita hasta que llega, y qué sigue pendiente', noPeriod: true,
+    build() {
+      const lt = leadTimes(); const rows = repItems().map(it => ({ it, a: lt.per.get(it.id) })).filter(r => r.a).sort((x, y) => (y.a.avg ?? -1) - (x.a.avg ?? -1));
+      return { title: 'Tiempos de entrega de solicitudes', sub: `${lt.n} entregas registradas · entrega típica (mediana): ${lt.med === null ? '—' : fmtN(lt.med, 1) + ' días'} · promedio: ${lt.avg === null ? '—' : fmtN(lt.avg, 1) + ' días'} · alerta de «tarde» después de ${cfg().diasEspera} días`,
+        cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Área', k: r => catName(r.it.catId) }, { t: 'Solicitudes', k: r => r.a.n, n: 1 }, { t: 'Recibidas', k: r => r.a.rec, n: 1 }, { t: 'Entrega promedio (días)', k: r => r.a.avg ?? '', n: 1, d: 1 }, { t: 'Entrega máxima (días)', k: r => r.a.max ?? '', n: 1 }, { t: 'Pendientes', k: r => r.a.pend, n: 1 }, { t: 'En camino (uds)', k: r => onOrder(r.it.id) || '', n: 1 }], rows };
     },
   },
   pedido: {
     n: 'Pedido sugerido', d: 'Artículos agotados, bajo mínimo o por agotarse, con cantidad sugerida', noPeriod: true,
     build() {
       const rows = repItems().map(it => ({ it, st: itemStatus(it) })).filter(r => NEEDS.includes(r.st.est)).map(r => ({ ...r, q: suggestQty(r.it, r.st) }));
-      return { title: 'Pedido sugerido', sub: `Al ${fmtDate(today())} · objetivo: ${cfg().diasObjetivo} días de cobertura o stock máximo del artículo`, cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Estado', k: r => r.st.est }, { t: 'Cantidad sugerida', k: r => r.q, n: 1 }, { t: 'Proveedor', k: r => provName(r.it.provId) }], rows };
+      return { title: 'Pedido sugerido', sub: `Al ${fmtDate(today())} · objetivo: ${cfg().diasObjetivo} días de cobertura o stock máximo del artículo`, cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Estado', k: r => r.st.est }, { t: 'En camino', k: r => r.st.camino || '', n: 1 }, { t: 'Cantidad sugerida', k: r => r.q, n: 1 }, { t: 'Proveedor', k: r => provName(r.it.provId) }], rows };
     },
   },
   flujo: {
@@ -1554,6 +1700,7 @@ const CFG = {
     return `<form class="card" data-submit="cfg" style="max-width:820px"><div class="grid g3"><div class="fld"><label>Nombre de la empresa</label><input name="empresa" value="${esc(c.empresa)}"></div><div class="fld"><label>Sucursal / ubicación</label><input name="sucursal" value="${esc(c.sucursal)}"></div><div class="fld"><label>Símbolo de moneda</label><input name="moneda" value="${esc(c.moneda)}" maxlength="4"></div></div>
     <div class="grid g2"><div class="fld"><label>Nombre del turno AM</label><input name="turnoAM" value="${esc(c.turnoAM)}"></div><div class="fld"><label>Nombre del turno PM</label><input name="turnoPM" value="${esc(c.turnoPM)}"></div></div>
     <h3 class="mb mt">Parámetros de reposición</h3><div class="grid g3"><div class="fld"><label>Ventana para calcular consumo (días)</label><input name="ventanaConsumo" type="number" min="7" max="365" value="${c.ventanaConsumo}"></div><div class="fld"><label>Alertar cuando queden menos de (días)</label><input name="diasReposicion" type="number" min="1" max="90" value="${c.diasReposicion}"></div><div class="fld"><label>Pedir hasta cubrir (días)</label><input name="diasObjetivo" type="number" min="1" max="180" value="${c.diasObjetivo}"></div></div>
+    <div class="grid g3"><div class="fld"><label>Días de espera antes de marcar una solicitud como «tarde»</label><input name="diasEspera" type="number" min="1" max="90" value="${c.diasEspera || 7}"></div><div class="fld"><label>Días a cubrir en el cierre de mes</label><input name="diasCierre" type="number" min="7" max="90" value="${c.diasCierre || 30}"></div></div>
     <small class="mut">Si un artículo no tiene stock mínimo, el sistema usa: consumo diario × días de alerta. El pedido sugerido llega hasta el stock máximo del artículo o, si no lo tiene, hasta cubrir los días objetivo.</small>
     <h3 class="mb mt">Solicitudes por WhatsApp y correo</h3><div class="grid g3"><div class="fld"><label>WhatsApp por defecto (con o sin 502)</label><input name="waDefault" value="${esc(c.waDefault)}" placeholder="5555 1234"></div><div class="fld"><label>Correo por defecto</label><input name="emailDefault" type="email" value="${esc(c.emailDefault)}"></div><div class="fld"><label>Código de país</label><input name="pais" value="${esc(c.pais)}"></div></div>
     <div class="row mt"><span class="sp"></span><button class="btn pri">Guardar configuración</button></div></form>`;
@@ -1591,7 +1738,7 @@ const CFG = {
   },
 };
 SUB.cfg = f => {
-  const g = n => f.elements[n].value; const c = { ...cfg(), empresa: g('empresa').trim() || 'EMPORIO', sucursal: g('sucursal').trim(), moneda: g('moneda').trim() || 'Q', turnoAM: g('turnoAM').trim() || 'Turno AM', turnoPM: g('turnoPM').trim() || 'Turno PM', ventanaConsumo: Math.max(7, num(g('ventanaConsumo')) || 30), diasReposicion: Math.max(1, num(g('diasReposicion')) || 7), diasObjetivo: Math.max(1, num(g('diasObjetivo')) || 14), waDefault: g('waDefault').trim(), emailDefault: g('emailDefault').trim(), pais: g('pais').replace(/\D/g, '') || '502', u: Date.now() };
+  const g = n => f.elements[n].value; const c = { ...cfg(), empresa: g('empresa').trim() || 'EMPORIO', sucursal: g('sucursal').trim(), moneda: g('moneda').trim() || 'Q', turnoAM: g('turnoAM').trim() || 'Turno AM', turnoPM: g('turnoPM').trim() || 'Turno PM', ventanaConsumo: Math.max(7, num(g('ventanaConsumo')) || 30), diasReposicion: Math.max(1, num(g('diasReposicion')) || 7), diasObjetivo: Math.max(1, num(g('diasObjetivo')) || 14), diasEspera: Math.max(1, num(g('diasEspera')) || 7), diasCierre: Math.max(7, num(g('diasCierre')) || 30), waDefault: g('waDefault').trim(), emailDefault: g('emailDefault').trim(), pais: g('pais').replace(/\D/g, '') || '502', u: Date.now() };
   DB.settings = c; commit(); log('Configuración', 'Parámetros actualizados'); toast('Configuración guardada', 'ok'); render();
 };
 /* categorías / proveedores */
@@ -1634,6 +1781,116 @@ CHG.impfile = async el => {
 };
 ACT.impgo = () => { if (!IMPORT) return; const r = importCatalog(IMPORT.rows, $('#impfecha').value || today()); IMPORT = null; toast(`Importados: ${r.nuevos} nuevos, ${r.act} actualizados`, 'ok'); S.cfgTab = 'importar'; go('inventario'); };
 ACT.tpl = () => templateXLSX();
+
+/* =====================================================================
+   PÁGINAS D: Abrir / Terminar unidad · Cierre de mes
+   ===================================================================== */
+
+/* ---------------------------- ABRIR / TERMINAR UNIDAD ---------------------------- */
+function openUnit(kind, id) {
+  const it = itemById(id), un = unitState(id), abrir = kind === 'open';
+  openModal({
+    title: `${abrir ? 'Abrir unidad' : 'Terminar unidad'} · ${esc(it.nombre)}`,
+    body: `<form id="unitform" data-submit="unit" data-kind="${kind}" data-id="${id}">
+      <div class="note">${abrir ? 'Pasa unidades de <b>Sellado</b> a <b>En uso</b>. Desde ese día se mide cuánto dura.' : 'Da por <b>terminadas</b> unidades que estaban en uso. Salen del inventario y se calcula cuántos días duraron.'}<br>
+      Ahora: <b>${fmtQty(un.sellado)}</b> sellado · <b>${fmtQty(un.uso)}</b> en uso · existencia real <b>${fmtQty(un.st)}</b> ${esc(it.unidad)}</div>
+      <div class="grid g3"><div class="fld"><label>Cantidad *</label><input name="cant" type="number" min="0" step="any" value="1" required></div>
+       <div class="fld"><label>Fecha *</label><input type="date" name="fecha" value="${today()}" max="${today()}" required></div>
+       <div class="fld"><label>Turno</label><select name="turno"><option value="AM" ${nowHM() < '14:00' ? 'selected' : ''}>${esc(cfg().turnoAM)}</option><option value="PM" ${nowHM() < '14:00' ? '' : 'selected'}>${esc(cfg().turnoPM)}</option></select></div></div>
+      <div class="fld"><label>Nota (opcional)</label><input name="nota" maxlength="120" placeholder="${abrir ? 'Ej. Se abrió para el baño de mujeres' : 'Ej. Se terminó antes de lo esperado'}"></div>
+      <div class="mf" style="padding:8px 0 0;border:0"><button type="button" class="btn" data-act="mclose">Cancelar</button><button class="btn pri">${abrir ? 'Abrir' : 'Terminar'}</button></div></form>`,
+  });
+}
+ACT.unitOpen = el => openUnit('open', el.dataset.id);
+ACT.unitDone = el => openUnit('done', el.dataset.id);
+SUB.unit = async f => {
+  const kind = f.dataset.kind, id = f.dataset.id, it = itemById(id), un = unitState(id), q = num(f.elements.cant.value), fecha = f.elements.fecha.value;
+  const er = chkDate(fecha, { label: 'La fecha' }) || chkQty(q, 'La cantidad', { max: 100000 }); if (er) return toast(er, 'bad');
+  const turno = f.elements.turno.value, nota = f.elements.nota.value.trim();
+  const mkOpen = (cant, n) => put('movements', mkMove({ itemId: id, dir: 'ev', tipo: 'abrir', cant, fecha, hora: '09:00', turno, src: 'abrir', nota: n }));
+  if (kind === 'open') {
+    if (q > un.sellado && !await confirmBox(`Solo hay <b>${fmtQty(un.sellado)}</b> sellado(s) de ${esc(it.nombre)}. ¿Abrir ${fmtQty(q)} de todos modos? (Si llegó mercadería, registra primero el ingreso.)`, 'Abrir igual')) return;
+    mkOpen(q, nota); log('Abrir unidad', `${it.nombre} x${q}`); toast('Unidad abierta: ahora está En uso', 'ok');
+  } else {
+    if (q > un.st && !await confirmBox(`La existencia de ${esc(it.nombre)} es <b>${fmtQty(un.st)}</b>. Al terminar ${fmtQty(q)} quedaría en negativo. ¿Registrar de todos modos?`, 'Registrar igual')) return;
+    const falta = q - un.uso; if (falta > 0) mkOpen(Math.min(falta, q), 'Apertura automática al terminar');   // se terminó algo que no se había abierto: se abre el mismo día
+    put('movements', mkMove({ itemId: id, dir: 'out', tipo: 'uso', cant: q, fecha, hora: '18:00', turno, src: 'terminar', costoU: it.costo, nota: 'Unidad terminada' + (nota ? ': ' + nota : '') }));
+    const uc = unitCycles(id); log('Terminar unidad', `${it.nombre} x${q}`); toast(uc.avg !== null ? `Unidad terminada · duración promedio ${fmtN(uc.avg, 1)} días` : 'Unidad terminada', 'ok');
+  }
+  closeModal(); render();
+};
+
+/* ---------------------------- CIERRE DE MES ---------------------------- */
+const prevMonth = () => { const d = new Date(); d.setDate(1); if (new Date().getDate() <= 10) d.setMonth(d.getMonth() - 1); return d.getFullYear() + '-' + pad(d.getMonth() + 1); };
+S.cm = { mes: prevMonth(), area: '', draft: {} };
+const mesRange = mes => { const [y, m] = mes.split('-').map(Number); return { from: `${mes}-01`, to: toISO(new Date(y, m, 0)) }; };
+const mesLabel = mes => { const [y, m] = mes.split('-').map(Number); return `${MESES[m - 1]} ${y}`; };
+const mesShift = (mes, n) => { const [y, m] = mes.split('-').map(Number), d = new Date(y, m - 1 + n, 1); return d.getFullYear() + '-' + pad(d.getMonth() + 1); };
+const cierreNote = (id, mes) => (ix().evs.get(id) || []).filter(e => e.tipo === 'cierre' && e.periodo === mes).pop();
+
+function cierreRows(mes) {
+  const { from, to } = mesRange(mes), hasta = to > today() ? today() : to, obj = cfg().diasCierre || 30;
+  return ix().items.filter(i => i.tipo === 'insumo' && (i.activo !== false || stockOf(i.id) > 0)).map(it => {
+    const s = summarize(it.id, from, to), st = itemStatus(it), fin = Math.max(0, stockOf(it.id, hasta)), un = unitState(it.id, hasta), perDay = st.u.perDay, cov = perDay > 0 ? fin / perDay : null;
+    const need = Math.ceil(perDay * obj), camino = onOrder(it.id);
+    let sug = Math.max(0, need - fin - camino); if (it.pack > 0 && sug > 0) sug = Math.ceil(sug / it.pack) * it.pack;
+    const note = cierreNote(it.id, mes), d = S.cm.draft[it.id] || {};
+    const pedir = d.pedir !== undefined ? d.pedir : (note ? note.cant : sug), texto = d.texto !== undefined ? d.texto : (note?.texto || '');
+    const auto = `Consumo del mes: ${fmtQty(s.consumo)} ${it.unidad}; promedio ${fmtN(perDay, perDay < 1 ? 2 : 1)}/día (${st.u.origen}). Existencia al cierre: ${fmtQty(fin)} (${cov === null ? 'sin datos de consumo' : fmtN(cov, 0) + ' días'}${camino ? ', +' + fmtQty(camino) + ' en camino' : ''}). Para ${obj} días se necesitan ${fmtQty(need)}.`;
+    return { it, s, st, fin, un, cov, sug, pedir, texto, auto, area: catName(it.catId), life: unitCycles(it.id).avg };
+  }).sort((a, b) => a.area.localeCompare(b.area, 'es') || a.it.nombre.localeCompare(b.it.nombre, 'es'));
+}
+function cierreDS() {
+  const mes = S.cm.mes, rows = cierreRows(mes).filter(r => !S.cm.area || r.it.catId === S.cm.area);
+  return { title: 'Cierre de mes de insumos · ' + mesLabel(mes), sub: `${fmtDate(mesRange(mes).from)} al ${fmtDate(mesRange(mes).to)} · solicitud sugerida para ${cfg().diasCierre || 30} días`,
+    cols: [{ t: 'Área', k: r => r.area }, { t: 'Artículo', k: r => r.it.nombre }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Inicial', k: r => r.s.ini, n: 1 }, { t: 'Ingresos', k: r => r.s.ing, n: 1 }, { t: 'Consumo', k: r => r.s.consumo, n: 1 }, { t: 'Existencia al cierre', k: r => r.fin, n: 1 }, { t: 'Sellado', k: r => r.un.sellado, n: 1 }, { t: 'En uso', k: r => r.un.uso, n: 1 }, { t: 'Cobertura (días)', k: r => r.cov ?? '', n: 1, d: 0 }, { t: 'Duración de 1 unidad (días)', k: r => r.life ?? '', n: 1, d: 1 }, { t: 'Pedir', k: r => r.pedir || '', n: 1 }, { t: 'Justificación', k: r => (r.pedir > 0 ? r.auto + (r.texto ? ' ' : '') : '') + r.texto }], rows };
+}
+EXPSRC.cierre = cierreDS;
+
+PAGES.cierre = {
+  title: 'Cierre de mes',
+  html() {
+    const mes = S.cm.mes, all = cierreRows(mes), rows = all.filter(r => !S.cm.area || r.it.catId === S.cm.area), edit = can('solicitud');
+    const areas = [...new Map(all.map(r => [r.it.catId, r.area])).entries()].sort((a, b) => a[1].localeCompare(b[1], 'es'));
+    const nPed = all.filter(r => r.pedir > 0).length;
+    let last = null;
+    const body = rows.map(r => { const hdr = r.area !== last ? `<tr class="grp"><td colspan="12"><b>${esc(r.area)}</b></td></tr>` : ''; last = r.area;
+      return hdr + `<tr data-id="${r.it.id}"><td><b>${esc(r.it.nombre)}</b><br><small class="mut">${esc(r.it.unidad)}${r.it.activo === false ? ' · archivado' : ''}</small></td><td class="r">${fmtQty(r.s.ini)}</td><td class="r">${r.s.ing ? '+' + fmtQty(r.s.ing) : '—'}</td><td class="r">${r.s.consumo ? fmtQty(r.s.consumo) : '—'}</td>
+        <td class="r"><b>${fmtQty(r.fin)}</b></td><td class="r">${fmtQty(r.un.sellado)}/${fmtQty(r.un.uso)}</td><td class="r">${r.cov === null ? '—' : fmtN(r.cov, 0) + ' d'}</td><td class="r">${r.life !== null ? fmtN(r.life, 1) + ' d' : '—'}</td>
+        <td class="r"><input class="q" type="number" min="0" step="any" name="pedir" value="${r.pedir || ''}" placeholder="0" ${edit ? '' : 'disabled'} data-input="cmrow" title="Sugerido por el programa: ${fmtQty(r.sug)}"><br><small class="mut">sug. ${fmtQty(r.sug)}</small></td>
+        <td style="min-width:240px"><input name="texto" value="${esc(r.texto)}" maxlength="240" placeholder="Comentario del mes…" ${edit ? '' : 'disabled'} data-input="cmrow" style="width:100%"><small class="mut" style="display:block;margin-top:2px">${esc(r.auto)}</small></td></tr>`; }).join('');
+    return `<div class="note">Al terminar el mes, revisa cada insumo: el programa calcula el <b>consumo real</b>, cuánto <b>cubre</b> lo que queda y <b>cuánto pedir</b> para el siguiente mes (consumo automático × ${cfg().diasCierre || 30} días − existencia − lo que ya viene en camino). Puedes ajustar la cantidad y escribir tu comentario; al generar la solicitud, cada línea lleva su justificación.</div>
+    <div class="tools"><div class="nav" style="display:flex;align-items:center;gap:6px"><button class="btn sm icon-btn" data-act="cmshift" data-n="-1" aria-label="Mes anterior">${ic('l')}</button><b style="min-width:140px;text-align:center">${esc(mesLabel(mes))}</b><button class="btn sm icon-btn" data-act="cmshift" data-n="1" aria-label="Mes siguiente">${ic('r')}</button></div>
+      <select data-change="cmarea"><option value="">Todas las áreas</option>${areas.map(([id, n]) => `<option value="${id}" ${S.cm.area === id ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>
+      <span class="sp"></span>${expBtns('cierre')}${edit ? `<button class="btn" data-act="cmSave">${ic('check')} Guardar comentarios</button><button class="btn pri" data-act="cmReq">${ic('send')} Generar solicitud del mes siguiente (${nPed})</button>` : ''}</div>
+    ${rows.length ? `<div class="tw"><table id="cmtbl"><thead><tr><th>Artículo</th><th class="r">Inicial</th><th class="r">Ingresos</th><th class="r">Consumo</th><th class="r">Existencia al cierre</th><th class="r" title="Sellado / En uso">Sell./Uso</th><th class="r">Cobertura</th><th class="r" title="Días promedio entre abrir y terminar una unidad">Dura 1 unidad</th><th class="r">Pedir</th><th>Comentario y justificación</th></tr></thead><tbody>${body}</tbody></table></div>` : `<div class="card empty"><b>No hay insumos</b>Carga el catálogo de insumos en Inventario.</div>`}`;
+  },
+};
+ACT.cmshift = el => { S.cm.mes = mesShift(S.cm.mes, +el.dataset.n); S.cm.draft = {}; render(); };
+CHG.cmarea = el => { S.cm.area = el.value; render(); };
+INP.cmrow = el => { const tr = el.closest('tr'), id = tr.dataset.id; const d = S.cm.draft[id] || (S.cm.draft[id] = {}); d.pedir = el.name === 'pedir' ? num(el.value) : (d.pedir ?? num(tr.querySelector('[name=pedir]').value)); d.texto = el.name === 'texto' ? el.value : (d.texto ?? tr.querySelector('[name=texto]').value); };
+function cierreSave() {
+  const mes = S.cm.mes; let n = 0;
+  const bad = Object.entries(S.cm.draft).map(([id, d]) => (d.pedir > 0 ? chkQty(d.pedir, 'La cantidad a pedir de ' + (itemById(id)?.nombre || ''), { max: 100000 }) : '')).find(Boolean);
+  if (bad) { toast(bad, 'bad'); return false; }
+  for (const [id, d] of Object.entries(S.cm.draft)) {
+    const it = itemById(id); if (!it) continue;
+    (ix().evs.get(id) || []).filter(e => e.tipo === 'cierre' && e.periodo === mes).forEach(e => del('movements', e.id));
+    if (d.pedir > 0 || (d.texto || '').trim()) { const ev = mkMove({ itemId: id, dir: 'ev', tipo: 'cierre', cant: d.pedir || 0, fecha: mesRange(mes).to > today() ? today() : mesRange(mes).to, hora: '23:59', src: 'cierre' }); ev.periodo = mes; ev.texto = (d.texto || '').trim(); put('movements', ev); n++; }
+  }
+  S.cm.draft = {}; if (n) log('Cierre de mes', `${mesLabel(mes)} · ${n} artículos con pedido o comentario`);
+  return true;
+}
+ACT.cmSave = () => { if (!Object.keys(S.cm.draft).length) return toast('No hay cambios por guardar'); if (cierreSave()) { toast('Cierre guardado', 'ok'); render(); } };
+ACT.cmReq = async () => {
+  if (Object.keys(S.cm.draft).length && !cierreSave()) return;
+  const mes = S.cm.mes, rows = cierreRows(mes).filter(r => r.pedir > 0);
+  if (!rows.length) return toast('No hay artículos con cantidad a pedir', 'bad');
+  if (!await confirmBox(`Se creará una solicitud de insumos con <b>${rows.length}</b> artículos para el mes siguiente de ${esc(mesLabel(mes))}, con su justificación en cada línea.`, 'Crear solicitud')) return;
+  const rec = { id: uid(), estado: 'Borrador', userId: S.user.id, folio: nextFolio(), fecha: today(), tipo: 'insumo', solicitante: S.user.nombre, urgencia: 'Normal', provId: '', destNombre: '', destTel: '', destEmail: '', fechaReq: '', nota: `Solicitud generada del cierre de ${mesLabel(mes)}.`,
+    lines: rows.map(r => ({ itemId: r.it.id, nombre: r.it.nombre, unidad: r.it.unidad, cant: r.pedir, stock: r.fin, just: (r.texto || r.auto).slice(0, 220) })) };
+  put('requests', rec); log('Crear solicitud', `${rec.folio} desde cierre de ${mesLabel(mes)}`); render(); go('solicitudes'); openRequest(rec.id);
+};
 
 /* =====================================================================
    ARRANQUE: inicio de sesión · registro · aprobación · app

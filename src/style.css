@@ -188,3 +188,4 @@ form:not([data-tipo=venta]) .only-venta{display:none}
 }
 
 .lines th.r,.lines td.r{text-align:left}.lines input.q{text-align:right}
+tr.grp td,tr.grp:hover td{background:var(--soft);font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);padding:7px 12px}

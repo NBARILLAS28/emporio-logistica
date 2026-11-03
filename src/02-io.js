@@ -83,7 +83,7 @@ function requestMessage(rq, mode) {
   if (rq.destNombre) out.push(`Para: ${rq.destNombre}`);
   out.push('');
   out.push(B('Detalle:'));
-  rq.lines.forEach((l, i) => out.push(`${i + 1}. ${l.nombre} - ${fmtQty(l.cant)} ${l.unidad || 'unidad'}${l.stock !== undefined ? `  (existencia actual: ${fmtQty(l.stock)})` : ''}`));
+  rq.lines.forEach((l, i) => out.push(`${i + 1}. ${l.nombre} - ${fmtQty(l.cant)} ${l.unidad || 'unidad'}${l.stock !== undefined ? `  (existencia actual: ${fmtQty(l.stock)})` : ''}${l.just ? `\n    Motivo: ${l.just}` : ''}`));
   if (rq.nota) { out.push(''); out.push(B('Notas:')); out.push(rq.nota); }
   out.push(''); out.push('Gracias.');
   return out.join('\n');
@@ -103,7 +103,7 @@ function requestDS(rq) {
   return {
     title: `Solicitud ${rq.folio} · ${rq.tipo === 'insumo' ? 'Insumos' : 'Productos para venta'}`,
     sub: `Fecha ${fmtDate(rq.fecha)} · Solicitante: ${rq.solicitante || '-'} · Para: ${rq.destNombre || '-'} · Urgencia: ${rq.urgencia}${rq.fechaReq ? ' · Requerida: ' + fmtDate(rq.fechaReq) : ''}${rq.nota ? ' · Nota: ' + rq.nota : ''}`,
-    cols: [{ t: '#', k: r => r._i }, { t: 'Artículo', k: 'nombre' }, { t: 'Unidad', k: 'unidad' }, { t: 'Existencia', k: 'stock', n: 1 }, { t: 'Cantidad solicitada', k: 'cant', n: 1 }],
+    cols: [{ t: '#', k: r => r._i }, { t: 'Artículo', k: 'nombre' }, { t: 'Unidad', k: 'unidad' }, { t: 'Existencia', k: 'stock', n: 1 }, { t: 'Cantidad solicitada', k: 'cant', n: 1 }, ...(rq.lines.some(l => l.just) ? [{ t: 'Motivo', k: 'just' }] : [])],
     rows: rq.lines.map((l, i) => ({ ...l, _i: i + 1 })),
   };
 }

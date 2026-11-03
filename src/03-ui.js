@@ -84,6 +84,7 @@ const NAV = [
   { id: 'turno', t: 'Cierre de turno', i: 'check', p: 'turno' },
   { id: 'conteo', t: 'Conteo físico', i: 'scale', p: 'ajuste' },
   { id: 'solicitudes', t: 'Solicitudes', i: 'send', p: 'ver' },
+  { id: 'cierre', t: 'Cierre de mes', i: 'clock', p: 'reportes' },
   { sec: 'Análisis' },
   { id: 'reportes', t: 'Reportes', i: 'file', p: 'reportes' },
   { sec: 'Administración' },

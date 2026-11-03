@@ -48,7 +48,7 @@ const PERM_LABEL = {
 const DEFAULT_SETTINGS = {
   empresa: 'EMPORIO', sucursal: 'Chimaltenango', moneda: 'Q',
   turnoAM: 'Turno AM (5:00)', turnoPM: 'Turno PM (2:00)',
-  ventanaConsumo: 30, diasReposicion: 7, diasObjetivo: 14,
+  ventanaConsumo: 30, diasReposicion: 7, diasObjetivo: 14, diasEspera: 7, diasCierre: 30,
   waDefault: '', emailDefault: '', pais: '502', u: 0,
 };
 const COLS = ['users', 'categories', 'suppliers', 'items', 'movements', 'requests', 'counts', 'audit'];
@@ -121,6 +121,20 @@ function setSaveStatus(st) {
 }
 
 
+/* ---------- validaciones de captura ---------- */
+function chkDate(iso, { min = '', max = today(), label = 'La fecha' } = {}) {
+  if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso) || isNaN(fromISO(iso))) return `${label} no es válida.`;
+  if (iso < '2020-01-01') return `${label} (${fmtDate(iso)}) es demasiado antigua; revisa el año.`;
+  if (max && iso > max) return `${label} (${fmtDate(iso)}) no puede ser posterior a ${fmtDate(max)}.`;
+  if (min && iso < min) return `${label} (${fmtDate(iso)}) no puede ser anterior a ${fmtDate(min)}.`;
+  return '';
+}
+function chkQty(q, label = 'La cantidad', { max = 1e6 } = {}) {
+  if (!(q > 0)) return `${label} debe ser un número mayor a 0.`;
+  if (q > max) return `${label} (${fmtQty(q)}) es demasiado grande; revisa si falta un punto decimal.`;
+  return '';
+}
+
 /* ---------- acceso a colecciones ---------- */
 const L = col => DB[col].filter(r => !r.del);
 function put(col, rec) {
@@ -135,11 +149,15 @@ function ix() {
   if (_ix) return _ix;
   const items = DB.items.filter(r => !r.del);
   const map = new Map(items.map(i => [i.id, i]));
-  const moves = DB.movements.filter(m => !m.del && map.has(m.itemId));
+  const all = DB.movements.filter(m => !m.del && map.has(m.itemId));
+  const moves = all.filter(m => m.dir !== 'ev');             // movimientos que cambian la existencia
+  const evs = new Map();                                      // eventos que no mueven stock: abrir unidad, notas de cierre
+  for (const m of all) if (m.dir === 'ev') { let a = evs.get(m.itemId); if (!a) { a = []; evs.set(m.itemId, a); } a.push(m); }
+  evs.forEach(a => a.sort((x, y) => x.fecha.localeCompare(y.fecha) || (x.hora || '').localeCompare(y.hora || '') || ((x.u || 0) - (y.u || 0))));
   moves.sort((a, b) => a.fecha.localeCompare(b.fecha) || (a.hora || '').localeCompare(b.hora || '') || ((a.u || 0) - (b.u || 0)));
   const byItem = new Map();
   for (const m of moves) { let a = byItem.get(m.itemId); if (!a) { a = []; byItem.set(m.itemId, a); } a.push(m); }
-  _ix = { items, map, moves, byItem, cats: new Map(L('categories').map(c => [c.id, c])), provs: new Map(L('suppliers').map(c => [c.id, c])), users: new Map(DB.users.map(u => [u.id, u])) };
+  _ix = { items, map, moves, byItem, evs, cats: new Map(L('categories').map(c => [c.id, c])), provs: new Map(L('suppliers').map(c => [c.id, c])), users: new Map(DB.users.map(u => [u.id, u])) };
   return _ix;
 }
 const itemById = id => ix().map.get(id);
@@ -212,6 +230,11 @@ function summarize(id, from, to) {
   r.cierre = r.ini + r.ing + r.aj - r.egr;
   return r;
 }
+/* Consumo por día calculado automáticamente:
+   · real      → lo medido en los movimientos de la ventana (salidas por uso, venta, merma…, incluye «Terminar unidad»)
+   · estimado  → consumo inicial del artículo (tomado del Excel de Octubre) mientras no hay datos propios
+   · mixto     → mezcla ponderada; el consumo real va ganando peso hasta cubrir 30 días de datos
+   Así el programa se «autoajusta» sin que nadie capture reglas a mano. */
 function usage(id, win) {
   win = win || cfg().ventanaConsumo || 30;
   const arr = ix().byItem.get(id) || [];
@@ -220,8 +243,72 @@ function usage(id, win) {
   if (start > end) start = end;
   const days = Math.max(1, daysBetween(start, end) + 1);
   let total = 0; for (const m of arr) if (m.fecha >= start && m.fecha <= end && CONSUMO.includes(m.tipo)) total += m.cant;
-  return { total, days, perDay: total / days };
+  const real = total / days, base = ix().map.get(id)?.baseDia || 0;
+  let perDay = real, origen = total > 0 ? 'real' : 'sin datos';
+  if (base > 0) {
+    if (total <= 0) { perDay = base; origen = 'estimado'; }
+    else { const w = Math.min(1, days / 30); perDay = w * real + (1 - w) * base; origen = w >= 1 ? 'real' : 'mixto'; }
+  }
+  return { total, days, perDay, origen, real, base };
 }
+
+/* ---------- unidades: Sellado → En uso → Terminado ---------- */
+/* «Terminar unidad» = salida por uso con src 'terminar'; «Abrir unidad» = evento (no mueve existencia).
+   Existencia real = Sellado + En uso. Lo Terminado ya salió del inventario. */
+function unitState(id, upTo) {
+  let opened = 0, done = 0;
+  for (const e of (ix().evs.get(id) || [])) { if (upTo && e.fecha > upTo) break; if (e.tipo === 'abrir') opened += e.cant; }
+  for (const m of (ix().byItem.get(id) || [])) { if (upTo && m.fecha > upTo) break; if (m.src === 'terminar' && m.dir === 'out') done += m.cant; }
+  const st = Math.max(0, stockOf(id, upTo)), uso = Math.min(st, Math.max(0, opened - done));
+  return { st, uso, sellado: st - uso, opened, done };
+}
+/* Ciclos de vida de cada unidad (PEPS): cuándo se abrió y cuándo se terminó */
+function unitCycles(id) {
+  const opens = [], cyc = [];
+  for (const e of (ix().evs.get(id) || [])) if (e.tipo === 'abrir') opens.push({ fecha: e.fecha, rest: e.cant, evId: e.id });
+  for (const m of (ix().byItem.get(id) || [])) {
+    if (m.src !== 'terminar' || m.dir !== 'out') continue;
+    let q = m.cant;
+    for (const o of opens) { if (q <= 0) break; if (o.rest > 0) { const t = Math.min(o.rest, q); o.rest -= t; q -= t; for (let i = 0; i < t; i++) cyc.push({ abrio: o.fecha, termino: m.fecha, dias: Math.max(1, daysBetween(o.fecha, m.fecha)) }); } }
+  }
+  const enUso = opens.filter(o => o.rest > 0).map(o => ({ abrio: o.fecha, cant: o.rest, dias: daysBetween(o.fecha, today()), evId: o.evId }));
+  const avg = cyc.length ? cyc.reduce((a, c) => a + c.dias, 0) / cyc.length : null;
+  return { cyc, enUso, avg, opens };
+}
+
+/* ---------- solicitudes: pedidos en camino y tiempos de entrega ---------- */
+const reqActive = r => !r.del && !r.hist && (r.estado === 'Enviada' || r.estado === 'Parcial');
+function onOrderMap() {
+  const X = ix(); if (X.oo) return X.oo;
+  const m = X.oo = new Map();
+  for (const r of DB.requests) { if (!reqActive(r)) continue; for (const l of r.lines || []) { const pend = Math.max(0, (l.cant || 0) - (l.recCant || 0)); if (pend > 0 && !l.cerrada) m.set(l.itemId, (m.get(l.itemId) || 0) + pend); } }
+  return m;
+}
+const onOrder = id => onOrderMap().get(id) || 0;
+const reqWaitDays = r => Math.max(0, daysBetween(r.fecha, today()));
+function pendingRequests() {
+  return L('requests').filter(reqActive).map(r => ({ r, dias: reqWaitDays(r), tarde: reqWaitDays(r) > (cfg().diasEspera || 7), pend: (r.lines || []).filter(l => (l.cant || 0) > (l.recCant || 0) && !l.cerrada).length }))
+    .sort((a, b) => b.dias - a.dias);
+}
+/* tiempo de entrega por artículo: de la fecha de solicitud a la fecha de recepción de cada línea */
+function leadTimes() {
+  const per = new Map(); let all = [];
+  for (const r of L('requests')) {
+    if (r.estado === 'Cancelada') continue;
+    for (const l of r.lines || []) {
+      if (!l.itemId) continue; let a = per.get(l.itemId); if (!a) { a = { n: 0, rec: 0, dias: [], pend: 0 }; per.set(l.itemId, a); }
+      a.n++;
+      if (l.recFecha) { const d = Math.max(0, daysBetween(r.fecha, l.recFecha)); a.rec++; a.dias.push(d); all.push(d); }
+      else if (!r.hist && reqActive(r) && !l.cerrada) a.pend++;
+    }
+  }
+  const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+  per.forEach(a => { a.avg = avg(a.dias); a.max = a.dias.length ? Math.max(...a.dias) : null; });
+  // la mediana evita que un solo error de captura distorsione el promedio global
+  const sorted = all.slice().sort((x, y) => x - y), med = sorted.length ? (sorted.length % 2 ? sorted[(sorted.length - 1) / 2] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2) : null;
+  return { per, avg: avg(all), med, n: all.length };
+}
+
 /* Lotes FIFO: mide cuánto tiempo dura cada ingreso hasta agotarse */
 function lotsOf(id) {
   const lots = [];
@@ -252,11 +339,11 @@ function itemStatus(it) {
   else if (cov !== null && cov < (cfg().diasReposicion || 7)) { est = 'Por agotarse'; cls = 'warn'; }
   else if (u.perDay === 0) { est = 'Sin movimiento'; cls = 'mut'; }
   else { est = 'OK'; cls = 'ok'; }
-  return { st, u, min, cov, est, cls, agot: cov !== null && st > 0 ? addDays(today(), Math.floor(cov)) : null };
+  return { st, u, min, cov, est, cls, camino: onOrder(it.id), agot: cov !== null && st > 0 ? addDays(today(), Math.floor(cov)) : null };
 }
 function suggestQty(it, s) {
   const target = it.max > 0 ? it.max : Math.ceil(s.u.perDay * (cfg().diasObjetivo || 14));
-  let q = Math.max(0, Math.ceil(target - s.st));
+  let q = Math.max(0, Math.ceil(target - s.st - (s.camino ?? onOrder(it.id))));
   if (it.pack > 0 && q > 0) q = Math.ceil(q / it.pack) * it.pack;
   return q;
 }
