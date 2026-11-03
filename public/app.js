@@ -1898,7 +1898,7 @@ ACT.cmReq = async () => {
 function showScreen(name) {
   ['boot', 'setup', 'login', 'app'].forEach(id => { const el = document.getElementById(id); if (el) el.hidden = id !== name; });
 }
-function brandHTML() { return `<div class="brand"><span class="logo"><i></i><i></i><i></i></span><div><b>EMPORIO</b><small>Logística interna · inventarios</small></div></div>`; }
+function brandHTML() { return `<div class="brand"><img class="logo" src="icons/logo-mark.png" alt="EMPORIO" width="335" height="640"><div><b>EMPORIO</b><small>Logística interna · inventarios</small></div></div>`; }
 const authCard = html => { showScreen('login'); $('#login').innerHTML = `<div class="authwrap"><div class="authcard">${brandHTML()}${html}</div></div>`; };
 const errMsg = e => {
   const m = String(e?.message || e || '');
@@ -1931,7 +1931,7 @@ function showLogin(msg = '', tab = 'in', ok = '') {
   const forgot = `<form data-submit="forgot"><p class="mut" style="margin-top:0;font-size:13px">Escribe tu correo y te enviamos un enlace para crear una contraseña nueva.</p>
     <div class="fld"><label>Correo</label><input name="email" type="email" required autofocus autocapitalize="none"></div>
     <button class="btn pri" style="width:100%;justify-content:center">Enviar enlace</button><p style="margin:14px 0 0;font-size:13px"><a href="#" data-act="atab" data-t="in">Volver</a></p></form>`;
-  authCard(`<h2 style="margin:4px 0 12px;font-size:18px">${esc(cfg().empresa)}</h2>${tab === 'forgot' ? '' : tabs}${notes}${tab === 'in' ? inForm : tab === 'up' ? upForm : forgot}`);
+  authCard(`<h2 style="margin:4px 0 12px;font-size:18px">${tab === 'up' ? 'Crea tu cuenta' : tab === 'forgot' ? 'Recupera tu contraseña' : 'Bienvenido'}</h2>${tab === 'forgot' ? '' : tabs}${notes}${tab === 'in' ? inForm : tab === 'up' ? upForm : forgot}`);
 }
 ACT.atab = (el, ev) => { ev?.preventDefault?.(); showLogin('', el.dataset.t); };
 SUB.login = async f => {
