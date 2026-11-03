@@ -24,7 +24,7 @@ svg.i{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stro
 #app{display:flex;min-height:100vh}
 .side{width:236px;background:var(--side);color:var(--sideink);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;flex:none;z-index:30}
 .brand{display:flex;gap:10px;align-items:center;padding:18px 16px 14px}
-.logo{height:38px;width:auto;flex:none;display:block}
+.logo{height:38px;width:38px;border-radius:9px;flex:none;display:block}.logo-app{display:block;width:100%;height:auto;border-radius:14px;background:#000}
 .brand b{display:block;letter-spacing:.18em;font-size:15px}
 .brand small{color:var(--sidemut);font-size:11px;letter-spacing:.04em}
 #nav{padding:6px 10px;flex:1;overflow:auto}
@@ -150,7 +150,7 @@ form:not([data-tipo=venta]) .only-venta{display:none}
 /* ---------- auth screens ---------- */
 .authwrap{min-height:100vh;display:grid;place-items:center;padding:20px;background:radial-gradient(1200px 500px at 70% -10%,#3a0a0e 0,#0d0d0f 60%)}
 .authcard{background:var(--card);border-radius:16px;width:min(470px,100%);padding:26px;box-shadow:0 20px 70px rgba(0,0,0,.5)}
-.authcard .brand{padding:0 0 14px;color:var(--ink);flex-direction:column;text-align:center;gap:12px;margin-bottom:6px}.authcard .brand .logo{height:104px}.authcard .brand small{display:block;margin-top:2px}.authcard .brand small{color:var(--mut)}
+.authcard .brand{padding:0 0 14px;color:var(--ink);flex-direction:column;text-align:center;gap:12px;margin-bottom:6px}.authcard .brand small{display:block;margin-top:2px}.authcard .logo-app{width:min(100%,330px);margin:0 auto}.authcard .brand small{color:var(--mut)}
 .authcard .brand b{font-size:18px}
 .opt{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;gap:10px;align-items:flex-start;cursor:pointer}
 .opt input{width:auto;margin-top:3px}

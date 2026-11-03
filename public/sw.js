@@ -1,10 +1,10 @@
 /* Service worker de EMPORIO Logística — permite instalar la app y abrirla sin conexión.
    Nunca guarda respuestas de Supabase (datos privados): esas siempre van a la red. */
-const VERSION = '4ea154c179';
+const VERSION = '02ccda9067';
 const CACHE = 'emporio-logistica-' + VERSION;
 const SHELL = ['./', 'index.html', 'app.js', 'style.css', 'config.js', 'manifest.webmanifest',
   'vendor/chart.js', 'vendor/jspdf.js', 'vendor/autotable.js', 'vendor/xlsx.js', 'vendor/supabase.js',
-  'icons/logo-mark.png', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
+  'icons/logo-app.png', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
 });

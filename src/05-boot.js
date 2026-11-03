@@ -4,7 +4,7 @@
 function showScreen(name) {
   ['boot', 'setup', 'login', 'app'].forEach(id => { const el = document.getElementById(id); if (el) el.hidden = id !== name; });
 }
-function brandHTML() { return `<div class="brand"><img class="logo" src="icons/logo-mark.png" alt="EMPORIO" width="335" height="640"><div><b>EMPORIO</b><small>Logística interna · inventarios</small></div></div>`; }
+function brandHTML() { return `<div class="brand"><img class="logo-app" src="icons/logo-app.png" alt="EMPORIO Logística" width="900" height="608"><div><b>EMPORIO</b><small>Logística interna · inventarios</small></div></div>`; }
 const authCard = html => { showScreen('login'); $('#login').innerHTML = `<div class="authwrap"><div class="authcard">${brandHTML()}${html}</div></div>`; };
 const errMsg = e => {
   const m = String(e?.message || e || '');
