@@ -1,6 +1,6 @@
 /* Service worker de EMPORIO Logística — permite instalar la app y abrirla sin conexión.
    Nunca guarda respuestas de Supabase (datos privados): esas siempre van a la red. */
-const VERSION = '3f8b4f4786';
+const VERSION = 'a5a2ae9c5e';
 const CACHE = 'emporio-logistica-' + VERSION;
 const SHELL = ['./', 'index.html', 'app.js', 'style.css', 'config.js', 'manifest.webmanifest',
   'vendor/chart.js', 'vendor/jspdf.js', 'vendor/autotable.js', 'vendor/xlsx.js', 'vendor/supabase.js',

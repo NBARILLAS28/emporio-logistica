@@ -158,11 +158,11 @@ const statusChip = s => chip(s.est, s.cls === 'warn2' ? 'warn' : s.cls);
 function dsTable(ds, opts = {}) {
   if (!ds.rows.length) return `<div class="empty"><b>Sin datos en este periodo</b>Cambia el periodo o registra movimientos.</div>`;
   const al = c => (c.n || c.a === 'r') ? ' class="r"' : '';
-  const head = ds.cols.map(c => `<th${al(c)}>${esc(c.t)}</th>`).join('');
+  const head = ds.cols.map(c => `<th${al(c)}>${esc(c.t)}</th>`).join('') + (opts.act ? '<th></th>' : '');
   const body = ds.rows.map(r => `<tr${opts.rowCls ? ` class="${opts.rowCls(r) || ''}"` : ''}>` + ds.cols.map(c => {
     const t = esc(cellText(r, c)); return `<td${al(c)}>${c.cls ? `<span class="chip ${c.cls(r)}">${t}</span>` : t}</td>`;
-  }).join('') + '</tr>').join('');
-  const foot = ds.foot ? '<tfoot><tr>' + ds.cols.map(c => `<td${al(c)}>${esc(footText(ds, c))}</td>`).join('') + '</tr></tfoot>' : '';
+  }).join('') + (opts.act ? `<td>${opts.act(r) || ''}</td>` : '') + '</tr>').join('');
+  const foot = ds.foot ? '<tfoot><tr>' + ds.cols.map(c => `<td${al(c)}>${esc(footText(ds, c))}</td>`).join('') + (opts.act ? '<td></td>' : '') + '</tr></tfoot>' : '';
   return `<div class="tw" ${opts.maxh ? `style="max-height:${opts.maxh}"` : ''}><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody>${foot}</table></div>`;
 }
 const itemOptions = (sel, tipo) => {

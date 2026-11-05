@@ -229,7 +229,7 @@ function kardexDS(id, from, to) {
   if (from > '0000-01-01') rows.push({ fecha: '', hora: '', turno: '', concepto: 'Saldo inicial', ent: '', sal: '', saldo, doc: '', user: '', nota: '' });
   for (const m of (ix().byItem.get(id) || [])) {
     if (m.fecha < from || m.fecha > to) continue; saldo += signed(m);
-    rows.push({ fecha: fmtDate(m.fecha), hora: m.hora, turno: m.turno, concepto: TIPO_LABEL[m.tipo], ent: m.dir === 'in' ? m.cant : '', sal: m.dir === 'out' ? m.cant : '', saldo, doc: m.doc || '', user: userName(m.userId), nota: m.nota || '' });
+    rows.push({ fecha: fmtDate(m.fecha), hora: m.hora, turno: m.turno, concepto: TIPO_LABEL[m.tipo], ent: m.dir === 'in' ? m.cant : '', sal: m.dir === 'out' ? m.cant : '', saldo, doc: m.doc || '', user: userName(m.userId), nota: m.nota || '', id: m.id });
   }
   return { title: 'Kardex · ' + it.nombre, sub: `Unidad: ${it.unidad} · ${from > '0000-01-01' ? fmtDate(from) + ' al ' + fmtDate(to) : 'historial completo'}`, cols: [{ t: 'Fecha', k: 'fecha' }, { t: 'Hora', k: 'hora' }, { t: 'Turno', k: 'turno' }, { t: 'Concepto', k: 'concepto' }, { t: 'Entrada', k: 'ent', n: 1 }, { t: 'Salida', k: 'sal', n: 1 }, { t: 'Saldo', k: 'saldo', n: 1 }, { t: 'Documento', k: 'doc' }, { t: 'Usuario', k: 'user' }, { t: 'Notas', k: 'nota' }], rows };
 }
@@ -255,7 +255,7 @@ ACT.kardex = el => {
     ${ins ? `<h4 class="mb">Unidades: de Sellado a Terminado <small class="mut">(cuántos días dura cada una)</small></h4><div class="tw mb"><table><thead><tr><th>Se abrió</th><th>Se terminó</th><th class="r">Duró</th><th></th></tr></thead><tbody>${ucRows || '<tr><td colspan="4" class="empty">Aún no hay unidades abiertas. Usa «Abrir» y «Terminar» en Inventario para medir cuánto dura cada una.</td></tr>'}</tbody></table></div>` : ''}
     <h4 class="mb">Lotes de ingreso y cuánto duraron <small class="mut">(método PEPS: lo primero que entra es lo primero que sale)</small></h4>
     <div class="tw mb"><table><thead><tr><th>Ingresó</th><th>Origen</th><th class="r">Cantidad</th><th>Se agotó</th><th class="r">Duración</th><th>Vence</th></tr></thead><tbody>${lotRows || '<tr><td colspan="6" class="empty">Sin ingresos registrados</td></tr>'}</tbody></table></div>
-    <div class="row mb"><h4 class="sp">Historial de movimientos</h4>${expBtns('kardexItem')}</div>${dsTable({ ...ds, rows: ds.rows.slice().reverse().slice(0, 150) }, { maxh: '300px' })}`,
+    <div class="row mb"><h4 class="sp">Historial de movimientos</h4>${expBtns('kardexItem')}</div>${dsTable({ ...ds, rows: ds.rows.slice().reverse().slice(0, 150) }, { maxh: '300px', act: r => r.id && can('mov') ? `<button class="btn sm icon-btn" title="Corregir concepto y notas" data-act="movQuick" data-id="${r.id}" data-from="kardex">${ic('edit')}</button>` : '' })}`,
   });
 };
 
@@ -334,6 +334,50 @@ function openMov(pre = {}) {
   });
   $$('#mlines select[name=itemId]').forEach(s => CHG.movitem(s));
 }
+/* Reparte lo que ingresa entre las líneas de solicitudes enviadas que aún faltan por recibir (la más antigua primero) */
+function matchPending(lines, fecha) {
+  const avail = {}; lines.forEach(l => { avail[l.itemId] = (avail[l.itemId] || 0) + l.cant; });
+  const out = [], reqs = L('requests').filter(r => reqActive(r) && (!fecha || r.fecha <= fecha)).sort((a, b) => a.fecha.localeCompare(b.fecha));
+  for (const r of reqs) for (const l of r.lines || []) {
+    const pend = Math.max(0, (l.cant || 0) - (l.recCant || 0)); if (!(pend > 0) || l.cerrada || !(avail[l.itemId] > 0)) continue;
+    const take = Math.min(pend, avail[l.itemId]); avail[l.itemId] -= take; out.push({ r, l, itemId: l.itemId, take, pend });
+  }
+  return out;
+}
+function applyPending(link, fecha) {
+  const byReq = new Map(); link.forEach(a => { if (!byReq.has(a.r.id)) byReq.set(a.r.id, { r: a.r, items: [] }); byReq.get(a.r.id).items.push(a); });
+  byReq.forEach(({ r, items }) => {
+    const lines = r.lines.map(l => { const a = items.find(x => x.l === l); return a ? { ...l, recCant: (l.recCant || 0) + a.take, recFecha: fecha, cerrada: false } : l; });
+    const full = lines.every(l => (l.recCant || 0) >= l.cant || l.cerrada);
+    put('requests', { ...r, lines, estado: full ? 'Recibida' : 'Parcial', recibida: fecha });
+    log('Recepción de solicitud', `${r.folio} · desde un ingreso en Movimientos`);
+  });
+}
+/* Corrección rápida: solo Concepto y Notas (sin tocar cantidades, fechas ni existencias) */
+const MOV_LOCK = m => m.src?.startsWith('turno') || m.src === 'conteo' || m.src === 'terminar'; // el concepto de estos lo fija el sistema
+ACT.movQuick = el => {
+  const m = DB.movements.find(x => x.id === el.dataset.id); if (!m || (m.dir !== 'in' && m.dir !== 'out')) return;
+  const it = itemById(m.itemId), lock = MOV_LOCK(m);
+  openModal({
+    title: 'Corregir concepto y notas',
+    body: `<form id="movq" data-submit="movq" data-id="${m.id}" data-from="${el.dataset.from || ''}">
+     <div class="note mb"><b>${esc(it?.nombre || '')}</b> · ${m.dir === 'in' ? '▲ Ingreso +' : '▼ Egreso −'}${fmtQty(m.cant)} ${esc(it?.unidad || '')} · ${fmtDate(m.fecha)} ${esc(m.hora || '')}<br><small>Aquí solo cambias el concepto y las notas; la cantidad y la existencia no se modifican.</small></div>
+     <div class="fld"><label>Concepto</label><select name="tipo" ${lock ? 'disabled' : ''}>${tipoOpts(m.dir, m.tipo)}</select>${lock ? '<small class="mut">Este movimiento viene del cierre de turno o del conteo; solo se pueden editar las notas.</small>' : ''}</div>
+     <div class="fld"><label>Notas / observaciones</label><textarea name="nota" rows="3">${esc(m.nota || '')}</textarea></div>
+     <div class="mf" style="padding:8px 0 0;border:0"><button type="button" class="btn" data-act="mclose">Cancelar</button><button class="btn pri">Guardar</button></div></form>`,
+  });
+};
+SUB.movq = f => {
+  const m = DB.movements.find(x => x.id === f.dataset.id); if (!m) return closeModal();
+  const tipo = MOV_LOCK(m) ? m.tipo : f.elements.tipo.value, nota = f.elements.nota.value.trim(), it = itemById(m.itemId);
+  if (tipo !== m.tipo || nota !== (m.nota || '')) {
+    put('movements', { ...m, tipo, nota });
+    log('Editar movimiento', `${it?.nombre || ''}: ${TIPO_LABEL[m.tipo]}${tipo !== m.tipo ? ' → ' + TIPO_LABEL[tipo] : ''}${nota !== (m.nota || '') ? ' (notas)' : ''}`);
+    toast('Movimiento actualizado', 'ok');
+  }
+  const back = f.dataset.from === 'kardex'; closeModal();
+  render(); if (back && it) ACT.kardex({ dataset: { id: it.id } });
+};
 ACT.newMov = () => openMov({});
 ACT.movFor = el => openMov({ itemId: el.dataset.id, dir: el.dataset.d });
 ACT.editMov = el => openMov({ edit: el.dataset.id });
@@ -359,11 +403,21 @@ SUB.mov = async (f, e) => {
     const bad = Object.entries(need).filter(([id, q]) => stockOf(id) + (editId ? (DB.movements.find(m => m.id === editId)?.itemId === id ? DB.movements.find(m => m.id === editId).cant : 0) : 0) < q);
     if (bad.length && !await confirmBox(`Existencia insuficiente en: <b>${bad.map(([id]) => esc(itemById(id).nombre)).join(', ')}</b>.<br>El inventario quedaría en negativo. ¿Registrar de todos modos?`, 'Registrar igual')) return;
   }
+  /* ¿Este ingreso es la entrega de un pedido en camino? Si sí, se marca recibido y desaparece «en camino» */
+  let link = [];
+  if (!editId && dir === 'in' && tipo === 'compra') {
+    link = matchPending(lines, g('fecha'));
+    if (link.length) {
+      const resumen = link.map(a => `<li><b>${esc(itemById(a.itemId).nombre)}</b>: ${fmtQty(a.take)} de ${fmtQty(a.pend)} ${esc(itemById(a.itemId).unidad)} en camino <small class="mut">(${esc(a.r.folio)})</small></li>`).join('');
+      if (!await confirmBox(`Este ingreso coincide con pedidos que estaban <b>en camino</b>:<ul style="margin:6px 0 6px 18px">${resumen}</ul>¿Es la entrega de esos pedidos? Se marcarán como recibidos (el ingreso no se duplica).`, 'Sí, es esa entrega')) link = [];
+    }
+  }
   if (editId) del('movements', editId);
   const nuevos = lines.map(l => {
-    const it = itemById(l.itemId);
-    return put('movements', mkMove({ itemId: l.itemId, dir, tipo, cant: l.cant, fecha: g('fecha'), hora: g('hora') || nowHM(), turno: g('turno'), doc: g('doc'), provId: dir === 'in' ? g('provId') : '', vence: dir === 'in' ? l.vence : '', nota: g('nota'), costoU: can('costos') ? (dir === 'in' ? l.costo : (l.costo || it.costo)) : it.costo, precioU: tipo === 'venta' ? (can('costos') && l.precio ? l.precio : it.precio) : 0 }));
+    const it = itemById(l.itemId), lk = link.find(a => a.itemId === l.itemId);
+    return put('movements', mkMove({ ...(lk ? { reqId: lk.r.id } : {}), itemId: l.itemId, dir, tipo, cant: l.cant, fecha: g('fecha'), hora: g('hora') || nowHM(), turno: g('turno'), doc: g('doc'), provId: dir === 'in' ? g('provId') : '', vence: dir === 'in' ? l.vence : '', nota: g('nota'), costoU: can('costos') ? (dir === 'in' ? l.costo : (l.costo || it.costo)) : it.costo, precioU: tipo === 'venta' ? (can('costos') && l.precio ? l.precio : it.precio) : 0 }));
   });
+  if (link.length) applyPending(link, g('fecha'));
   if (can('costos') && dir === 'in' && tipo === 'compra') lines.forEach(l => { const it = itemById(l.itemId); if (l.costo > 0 && l.costo !== it.costo) put('items', { ...it, costo: l.costo }); }); // último costo de compra
   log(editId ? 'Editar movimiento' : (dir === 'in' ? 'Ingreso' : 'Egreso'), `${TIPO_LABEL[tipo]}: ` + lines.map(l => `${itemById(l.itemId).nombre} x${l.cant}`).join(', '));
   toast(`${nuevos.length} movimiento(s) guardado(s)`, 'ok');
