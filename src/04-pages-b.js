@@ -225,7 +225,7 @@ ACT.reqReceive = el => {
   openModal({
     title: 'Registrar recepción · ' + esc(r.folio), size: 'mid',
     body: `<form id="recform" data-submit="rec" data-id="${r.id}"><div class="grid g3"><div class="fld"><label>Fecha de recepción</label><input type="date" name="fecha" value="${today()}" min="${r.fecha}" max="${today()}"></div><div class="fld"><label>Documento / factura</label><input name="doc"></div><div class="fld"><label>Proveedor</label><select name="provId">${provOptions(r.provId)}</select></div></div>
-    <div class="tw"><table class="lines"><thead><tr><th>Artículo</th><th class="r">Pedido</th><th class="r">Ya recibido</th><th class="r">Recibido hoy</th>${costos ? '<th class="r">Costo unit.</th>' : ''}<th title="Marca si lo que falta ya no llegará">Cerrar lo pendiente</th></tr></thead><tbody>${r.lines.map(l => { const pend = Math.max(0, l.cant - (l.recCant || 0)); return `<tr data-id="${l.itemId}"><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r">${fmtQty(l.recCant || 0)}</td><td class="r"><input class="q" name="rec" type="number" min="0" step="any" value="${l.cerrada ? 0 : pend}"</td>${costos ? `<td class="r"><input class="q" name="costo" type="number" min="0" step="any" value="${itemById(l.itemId)?.costo || ''}"></td>` : ''}<td style="text-align:center"><input type="checkbox" name="cerrar" style="width:auto" ${l.cerrada ? 'checked' : ''}></td></tr>`; }).join('')}</tbody></table></div>
+    <div class="tw"><table class="lines"><thead><tr><th>Artículo</th><th class="r">Pedido</th><th class="r">Ya recibido</th><th class="r">Recibido hoy</th>${costos ? '<th class="r">Costo unit.</th>' : ''}<th title="Opcional: fecha de vencimiento del lote que llega">Vence</th><th title="Marca si lo que falta ya no llegará">Cerrar lo pendiente</th></tr></thead><tbody>${r.lines.map(l => { const pend = Math.max(0, l.cant - (l.recCant || 0)); return `<tr data-id="${l.itemId}"><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r">${fmtQty(l.recCant || 0)}</td><td class="r"><input class="q" name="rec" type="number" min="0" step="any" value="${l.cerrada ? 0 : pend}"</td>${costos ? `<td class="r"><input class="q" name="costo" type="number" min="0" step="any" value="${itemById(l.itemId)?.costo || ''}"></td>` : ''}<td><input type="date" name="vence" style="width:135px"></td><td style="text-align:center"><input type="checkbox" name="cerrar" style="width:auto" ${l.cerrada ? 'checked' : ''}></td></tr>`; }).join('')}</tbody></table></div>
     <small class="mut">Se crearán los ingresos en el inventario con la fecha indicada y quedará registrado cuántos días tardó cada artículo.</small>
     <div class="mf" style="padding:12px 0 0;border:0"><button type="button" class="btn" data-act="mclose">Cancelar</button><button class="btn pri">Registrar ingreso</button></div></form>`,
   });
@@ -235,6 +235,7 @@ SUB.rec = f => {
   { const er = chkDate(fecha, { label: 'La fecha de recepción', min: r.fecha }); if (er) return toast(er, 'bad'); }
   const rows = $$('tbody tr', f).map(tr => ({ tr, l: r.lines.find(x => x.itemId === tr.dataset.id), it: itemById(tr.dataset.id), q: num(tr.querySelector('[name=rec]').value), cerrar: tr.querySelector('[name=cerrar]').checked }));
   { const er = rows.filter(x => x.q > 0).map(x => chkQty(x.q, 'La cantidad recibida de ' + x.l.nombre)).find(Boolean); if (er) return toast(er, 'bad'); }
+  { const bv = rows.find(x => x.q > 0 && (x.tr.querySelector('[name=vence]')?.value || '9999') < fecha); if (bv) return toast(`La fecha de vencimiento de ${bv.l.nombre} es anterior a la de recepción.`, 'bad'); }
   const exceso = rows.find(x => x.q > 0 && (x.l.recCant || 0) + x.q > x.l.cant * 1.5 + 1e-9);
   if (!rows.some(x => x.q > 0) && !rows.some(x => x.cerrar && !x.l.cerrada)) return toast('Escribe al menos una cantidad recibida', 'bad');
   const go = () => {
@@ -242,7 +243,7 @@ SUB.rec = f => {
     const lines = r.lines.map(l => { const x = rows.find(y => y.l === l); if (!x) return l; const nl = { ...l };
       if (x.q > 0) { nl.recCant = (l.recCant || 0) + x.q; nl.recFecha = fecha; }
       nl.cerrada = x.cerrar && nl.cant > (nl.recCant || 0); return nl; });
-    rows.forEach(x => { if (x.q > 0 && x.it) { const c = num(x.tr.querySelector('[name=costo]')?.value) || x.it.costo; put('movements', mkMove({ itemId: x.it.id, dir: 'in', tipo: 'compra', cant: x.q, fecha, doc: f.elements.doc.value || r.folio, provId: f.elements.provId.value, reqId: r.id, src: 'solicitud', costoU: c, nota: 'Recepción de ' + r.folio })); if (c > 0 && c !== x.it.costo && can('costos')) put('items', { ...x.it, costo: c }); n++; } });
+    rows.forEach(x => { if (x.q > 0 && x.it) { const c = num(x.tr.querySelector('[name=costo]')?.value) || x.it.costo; put('movements', mkMove({ itemId: x.it.id, dir: 'in', tipo: 'compra', cant: x.q, fecha, doc: f.elements.doc.value || r.folio, provId: f.elements.provId.value, reqId: r.id, src: 'solicitud', costoU: c, vence: x.tr.querySelector('[name=vence]')?.value || '', nota: 'Recepción de ' + r.folio })); if (c > 0 && c !== x.it.costo && can('costos')) put('items', { ...x.it, costo: c }); n++; } });
     const full = lines.every(l => (l.recCant || 0) >= l.cant || l.cerrada);
     put('requests', { ...r, lines, estado: full ? 'Recibida' : 'Parcial', recibida: fecha }); log('Recepción de solicitud', `${r.folio} · ${n} artículos`);
     closeModal(); toast('Ingreso registrado en el inventario', 'ok'); render();
@@ -275,7 +276,7 @@ const REP = {
     },
   },
   inventario: {
-    n: 'Inventario actual', d: 'Existencias, estado y valor al costo de hoy', noPeriod: true,
+    n: 'Inventario actual', get d() { return can('costos') ? 'Existencias, estado y valor al costo de hoy' : 'Existencias y estado de hoy'; }, noPeriod: true,
     build() {
       const costos = can('costos'), rows = repItems().map(it => ({ it, st: itemStatus(it) }));
       const cols = [{ t: 'Código', k: r => r.it.codigo || '' }, { t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Categoría', k: r => catName(r.it.catId) }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Estado', k: r => r.st.est }, { t: 'Ubicación', k: r => r.it.ubicacion || '' }];
@@ -309,6 +310,14 @@ const REP = {
     build() {
       const rows = repItems().map(it => ({ it, st: itemStatus(it) })).filter(r => NEEDS.includes(r.st.est)).map(r => ({ ...r, q: suggestQty(r.it, r.st) }));
       return { title: 'Pedido sugerido', sub: `Al ${fmtDate(today())} · objetivo: ${cfg().diasObjetivo} días de cobertura o stock máximo del artículo`, cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Estado', k: r => r.st.est }, { t: 'En camino', k: r => r.st.camino || '', n: 1 }, { t: 'Cantidad sugerida', k: r => r.q, n: 1 }, { t: 'Proveedor', k: r => provName(r.it.provId) }], rows };
+    },
+  },
+  vencimientos: {
+    n: 'Próximos a vencer', d: 'Lotes con existencia que ya vencieron o vencen pronto (según los días de aviso de Configuración)', noPeriod: true,
+    build() {
+      const rows = expiryAlerts().filter(a => S.repTipo === 'todo' || a.it.tipo === S.repTipo);
+      return { title: 'Productos próximos a vencer', sub: `Al ${fmtDate(today())} · aviso con ${cfg().diasVencer || 30} días de anticipación · ${rows.filter(r => r.e.k === 'vencido').length} vencido(s)`,
+        cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Categoría', k: r => catName(r.it.catId) }, { t: 'Ingresó', k: r => fmtDate(r.l.fecha) }, { t: 'Quedan', k: r => r.l.rest, n: 1 }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Vence', k: r => fmtDate(r.l.vence) }, { t: 'Días', k: r => r.e.dias, n: 1 }, { t: 'Aviso', k: r => r.e.k === 'vencido' ? 'Vencido' : r.e.k === 'urgente' ? 'Urgente' : 'Por vencer' }, { t: 'Ubicación', k: r => r.it.ubicacion || '' }], rows };
     },
   },
   flujo: {

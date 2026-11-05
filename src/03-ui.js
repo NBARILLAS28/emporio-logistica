@@ -97,7 +97,8 @@ function buildNav() {
   for (const n of NAV) {
     if (n.sec) { pend = `<div class="sec">${n.sec}</div>`; continue; }
     if (!can(n.p)) continue;
-    h += pend + `<a data-act="go" data-page="${n.id}" class="${S.page === n.id ? 'on' : ''}">${ic(n.i)}<span>${n.t}</span></a>`; pend = '';
+    const bd = n.id === 'inventario' && DB && ix().items.length ? expiryAlerts().length : 0;
+    h += pend + `<a data-act="go" data-page="${n.id}" class="${S.page === n.id ? 'on' : ''}">${ic(n.i)}<span>${n.t}</span>${bd ? `<em class="navbadge" title="Lotes vencidos o por vencer">${bd}</em>` : ''}</a>`; pend = '';
   }
   $('#nav').innerHTML = h;
   const u = S.user;
@@ -119,7 +120,7 @@ function render() {
   const pg = PAGES[S.page];
   $('#title').textContent = pg.title;
   buildNav();
-  $('#pbar').hidden = !PAGES_WITH_PERIOD.includes(S.page);
+  $('#pbar').hidden = !PAGES_WITH_PERIOD.includes(S.page) || (S.page === 'dashboard' && simpleDash());
   if (!$('#pbar').hidden) renderPbar();
   $('#view').innerHTML = pg.html();
   if (pg.mount) pg.mount();

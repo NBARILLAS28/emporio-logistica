@@ -36,6 +36,7 @@ const UNIDADES = ['unidad', 'botella', 'lata', 'caja', 'paquete', 'bolsa', 'gal�
 const ROLES = {
   admin: { n: 'Administrador', d: 'Control total: usuarios, configuración, respaldo y todo lo demás.', p: ['ver', 'mov', 'turno', 'catalogo', 'ajuste', 'solicitud', 'reportes', 'costos', 'anular', 'usuarios', 'config', 'respaldo'] },
   supervisor: { n: 'Supervisor', d: 'Administra el inventario, aprueba ajustes y ve costos. No gestiona usuarios.', p: ['ver', 'mov', 'turno', 'catalogo', 'ajuste', 'solicitud', 'reportes', 'costos', 'anular'] },
+  encargado: { n: 'Encargado', simple: true, d: 'Igual que Supervisor (inventario, ajustes, conteos, solicitudes, anular) pero sin costos ni dinero en ninguna pantalla. Tablero simple: existencias, agotados y por agotarse.', p: ['ver', 'mov', 'turno', 'catalogo', 'ajuste', 'solicitud', 'reportes', 'anular'] },
   operador: { n: 'Operador / Bodega', d: 'Registra ingresos, egresos y cierres de turno; crea solicitudes. No ve costos ni edita el catálogo.', p: ['ver', 'mov', 'turno', 'solicitud', 'reportes'] },
   consulta: { n: 'Solo consulta', d: 'Puede ver el tablero, inventario y reportes. No modifica nada.', p: ['ver', 'reportes'] },
 };
@@ -48,7 +49,7 @@ const PERM_LABEL = {
 const DEFAULT_SETTINGS = {
   empresa: 'EMPORIO', sucursal: 'Chimaltenango', moneda: 'Q',
   turnoAM: 'Turno AM (5:00)', turnoPM: 'Turno PM (2:00)',
-  ventanaConsumo: 30, diasReposicion: 7, diasObjetivo: 14, diasEspera: 7, diasCierre: 30,
+  ventanaConsumo: 30, diasReposicion: 7, diasObjetivo: 14, diasEspera: 7, diasCierre: 30, diasVencer: 30,
   waDefault: '', emailDefault: '', pais: '502', u: 0,
 };
 const COLS = ['users', 'categories', 'suppliers', 'items', 'movements', 'requests', 'counts', 'audit'];
@@ -348,6 +349,34 @@ function suggestQty(it, s) {
   return q;
 }
 const NEEDS = ['Agotado', 'Bajo mínimo', 'Por agotarse'];
+
+/* Vencimientos: lotes con existencia que vencen dentro de «diasVencer» días (o ya vencidos) */
+const simpleDash = () => !!(S.user && ROLES[S.user.rol]?.simple);
+function expState(vence) {
+  if (!vence) return null;
+  const d = daysBetween(today(), vence), lim = cfg().diasVencer || 30;
+  if (d < 0) return { k: 'vencido', cls: 'bad', dias: d, txt: 'Vencido hace ' + (-d) + ' d' };
+  if (d <= 7) return { k: 'urgente', cls: 'bad', dias: d, txt: d === 0 ? 'Vence hoy' : 'Vence en ' + d + ' d' };
+  if (d <= lim) return { k: 'proximo', cls: 'warn', dias: d, txt: 'Vence en ' + d + ' d' };
+  return { k: 'ok', cls: 'ok', dias: d, txt: 'Vence ' + fmtDate(vence) };
+}
+let _expKey = null, _expVal = null;
+function expiryAlerts() { // [{it, l, e}] ordenado por fecha de vencimiento; se recalcula solo cuando cambian los datos
+  const key = ix();
+  if (_expKey === key && _expVal) return _expVal;
+  const out = [];
+  for (const it of key.items) {
+    if (it.activo === false) continue;
+    for (const l of lotsOf(it.id).lots) {
+      if (l.rest > 0 && l.vence) { const e = expState(l.vence); if (e.k !== 'ok') out.push({ it, l, e }); }
+    }
+  }
+  out.sort((a, b) => a.l.vence.localeCompare(b.l.vence));
+  _expKey = key; _expVal = out; return out;
+}
+/* primer vencimiento (más próximo) con existencia de un artículo */
+function nextExpiry(id) { const a = expiryAlerts().find(x => x.it.id === id); return a || null; }
+const expChip = (e, l) => e ? `<span class="chip ${e.cls}" title="${l ? 'Quedan ' + fmtQty(l.rest) + ' · vence ' + fmtDate(l.vence) : ''}">${e.txt}</span>` : '';
 
 /* flujo ingresos / egresos por tramo de tiempo */
 function flowBuckets(from, to) {
@@ -858,7 +887,8 @@ function buildNav() {
   for (const n of NAV) {
     if (n.sec) { pend = `<div class="sec">${n.sec}</div>`; continue; }
     if (!can(n.p)) continue;
-    h += pend + `<a data-act="go" data-page="${n.id}" class="${S.page === n.id ? 'on' : ''}">${ic(n.i)}<span>${n.t}</span></a>`; pend = '';
+    const bd = n.id === 'inventario' && DB && ix().items.length ? expiryAlerts().length : 0;
+    h += pend + `<a data-act="go" data-page="${n.id}" class="${S.page === n.id ? 'on' : ''}">${ic(n.i)}<span>${n.t}</span>${bd ? `<em class="navbadge" title="Lotes vencidos o por vencer">${bd}</em>` : ''}</a>`; pend = '';
   }
   $('#nav').innerHTML = h;
   const u = S.user;
@@ -880,7 +910,7 @@ function render() {
   const pg = PAGES[S.page];
   $('#title').textContent = pg.title;
   buildNav();
-  $('#pbar').hidden = !PAGES_WITH_PERIOD.includes(S.page);
+  $('#pbar').hidden = !PAGES_WITH_PERIOD.includes(S.page) || (S.page === 'dashboard' && simpleDash());
   if (!$('#pbar').hidden) renderPbar();
   $('#view').innerHTML = pg.html();
   if (pg.mount) pg.mount();
@@ -957,9 +987,44 @@ ACT.exp = el => {
 const emptyCatalog = () => `<div class="card empty"><b>Aún no hay artículos</b>Crea tu primer artículo en <a href="#" data-act="go" data-page="inventario">Inventario</a> o impórtalos desde Excel en Configuración → Importar.</div>`;
 
 /* ---------------------------- TABLERO ---------------------------- */
+/* Bloque de vencimientos (todos los roles): lotes con existencia vencidos o por vencer */
+function expiryBlock(items, max = 8) {
+  const set = items ? new Set(items.map(i => i.id)) : null;
+  const al = expiryAlerts().filter(a => !set || set.has(a.it.id));
+  if (!al.length) return '';
+  const nV = al.filter(a => a.e.k === 'vencido').length;
+  return `<div class="card"><h3>Vencimientos <small>${nV ? nV + ' vencido(s) · ' : ''}${al.length - nV} por vencer en ${cfg().diasVencer || 30} días</small></h3>
+   <div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Quedan</th><th>Vence</th><th>Aviso</th></tr></thead><tbody>${al.slice(0, max).map(a => `<tr><td>${esc(a.it.nombre)}</td><td class="r">${fmtQty(a.l.rest)} <small class="mut">${esc(a.it.unidad)}</small></td><td>${fmtDate(a.l.vence)}</td><td>${expChip(a.e, a.l)}</td></tr>`).join('')}</tbody></table></div>${al.length > max ? `<small class="mut">+${al.length - max} más · filtra «Por vencer» en Inventario o abre el reporte «Próximos a vencer»</small>` : ''}</div>`;
+}
+/* Tablero simple (rol Encargado): solo existencias, agotados, por agotarse y vencimientos. Sin dinero. */
+function dashSimple() {
+  const items = ix().items.filter(i => i.activo !== false && (S.scope === 'todo' || i.tipo === S.scope));
+  const seg = `<div class="seg mb">${[['todo', 'Todo'], ['producto', 'Productos para venta'], ['insumo', 'Insumos']].map(([k, t]) => `<button data-act="scope" data-s="${k}" class="${S.scope === k ? 'on' : ''}">${t}</button>`).join('')}</div>`;
+  if (!ix().items.length) return seg + emptyCatalog();
+  const rows = items.map(it => ({ it, st: itemStatus(it) })).sort((a, b) => a.it.nombre.localeCompare(b.it.nombre, 'es'));
+  const agot = rows.filter(r => r.st.est === 'Agotado');
+  const prox = rows.filter(r => r.st.est === 'Bajo mínimo' || r.st.est === 'Por agotarse').sort((a, b) => (a.st.cov ?? 999) - (b.st.cov ?? 999));
+  const venc = expiryAlerts().filter(a => items.includes(a.it));
+  const kpi = (cls, lbl, val, sub) => `<div class="kpi ${cls}"><small>${lbl}</small><b>${val}</b><span>${sub}</span></div>`;
+  const kp = kpi('k-info', 'Existencia total', fmtQty(rows.reduce((a, r) => a + Math.max(0, r.st.st), 0)) + ' uds', rows.length + ' artículos activos')
+    + kpi('k-out', 'Agotados', agot.length, agot.length ? 'Sin existencia, hay que reponer' : 'Ninguno')
+    + kpi('k-warn', 'Próximos a agotarse', prox.length, 'Bajo el mínimo o con poca cobertura')
+    + kpi(venc.length ? 'k-out' : 'k-in', 'Por vencer / vencidos', venc.length, venc.length ? venc.filter(a => a.e.k === 'vencido').length + ' vencido(s)' : 'Todo vigente');
+  const reqBtn = tipo => { const n = [...agot, ...prox].filter(r => r.it.tipo === tipo).length; return can('solicitud') && n ? `<button class="btn sm pri" data-act="reqAlerts" data-t="${tipo}">${ic('send')} Solicitar ${tipo === 'insumo' ? 'insumos' : 'productos'} (${n})</button>` : ''; };
+  const line = (r, extra) => `<tr><td>${esc(r.it.nombre)} <small class="mut">${r.it.tipo === 'insumo' ? '· insumo' : ''}</small></td><td class="r"><b>${fmtQty(r.st.st)}</b> <small class="mut">${esc(r.it.unidad)}</small></td>${extra}</tr>`;
+  const tAgot = agot.length ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Mínimo</th><th>Pedido</th></tr></thead><tbody>${agot.map(r => line(r, `<td class="r">${r.st.min || '—'}</td><td>${r.st.camino ? `<span class="chip info">+${fmtQty(r.st.camino)} en camino</span>` : '<span class="mut">—</span>'}</td>`)).join('')}</tbody></table></div>` : '<div class="empty"><b>Sin agotados</b>Todos los artículos tienen existencia.</div>';
+  const tProx = prox.length ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Mínimo</th><th class="r">Alcanza</th><th>Estado</th></tr></thead><tbody>${prox.map(r => line(r, `<td class="r">${r.st.min || '—'}</td><td class="r">${r.st.cov === null ? '—' : fmtN(r.st.cov, 0) + ' d'}</td><td>${statusChip(r.st)}${r.st.camino ? ` <span class="chip info">+${fmtQty(r.st.camino)} en camino</span>` : ''}</td>`)).join('')}</tbody></table></div>` : '<div class="empty"><b>Todo en orden</b>Nada próximo a agotarse.</div>';
+  const tAll = `<div class="tw" style="max-height:480px;overflow:auto"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th>Estado</th></tr></thead><tbody>${rows.map(r => `<tr><td>${esc(r.it.nombre)} <small class="mut">${esc(catName(r.it.catId))}</small></td><td class="r"><b>${fmtQty(r.st.st)}</b> <small class="mut">${esc(r.it.unidad)}</small></td><td>${statusChip(r.st)}</td></tr>`).join('')}</tbody></table></div>`;
+  return seg + `<div class="kpis">${kp}</div>
+   <div class="cols2"><div class="card"><h3>Agotados <small>${agot.length}</small></h3>${tAgot}</div>
+    <div class="card"><h3>Próximos a agotarse <small>${prox.length}</small><span class="row" style="gap:6px">${reqBtn('producto')}${reqBtn('insumo')}</span></h3>${tProx}</div></div>
+   ${expiryBlock(items, 10)}
+   <div class="card"><h3>Existencias <small>${rows.length} artículos</small></h3>${tAll}</div>`;
+}
 PAGES.dashboard = {
   title: 'Tablero',
   html() {
+    if (simpleDash()) return dashSimple();
     const { from, to } = periodRange();
     const items = ix().items.filter(i => i.activo !== false && (S.scope === 'todo' || i.tipo === S.scope));
     const seg = `<div class="seg mb">${[['todo', 'Todo'], ['producto', 'Productos para venta'], ['insumo', 'Insumos']].map(([k, t]) => `<button data-act="scope" data-s="${k}" class="${S.scope === k ? 'on' : ''}">${t}</button>`).join('')}</div>`;
@@ -988,21 +1053,20 @@ PAGES.dashboard = {
     const pend = pendingRequests(), lt = leadTimes();
     const pendHTML = pend.length ? `<div class="card"><h3>Solicitudes en espera <small>${pend.length} sin recibir completas${lt.med !== null ? ` · entrega típica: ${fmtN(lt.med, 0)} días` : ''}</small><button class="btn sm" data-act="go" data-page="solicitudes">Ver solicitudes</button></h3><div class="tw"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Para</th><th class="r">Pendientes</th><th class="r">Espera</th></tr></thead><tbody>${pend.slice(0, 6).map(p => `<tr><td><b>${esc(p.r.folio)}</b></td><td>${fmtDate(p.r.fecha)}</td><td>${esc(p.r.destNombre || (p.r.tipo === 'insumo' ? 'Insumos' : 'Productos'))}</td><td class="r">${p.pend} art.</td><td class="r">${p.tarde ? chip(p.dias + ' d · tarde', 'bad') : chip(p.dias + ' d', 'info')}</td></tr>`).join('')}</tbody></table></div></div>` : '';
     const nProd = alerts.filter(r => r.it.tipo === 'producto').length, nIns = alerts.filter(r => r.it.tipo === 'insumo').length;
-    const venc = []; items.forEach(it => lotsOf(it.id).lots.forEach(l => { if (l.rest > 0 && l.vence && l.vence <= addDays(today(), 30)) venc.push({ it, l }); })); venc.sort((a, b) => a.l.vence.localeCompare(b.l.vence));
-    const vencHTML = venc.length ? `<h3 class="mt">Por vencer <small>próximos 30 días</small></h3><div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Quedan</th><th>Vence</th></tr></thead><tbody>${venc.slice(0, 6).map(v => `<tr><td>${esc(v.it.nombre)}</td><td class="r">${fmtQty(v.l.rest)}</td><td>${fmtDate(v.l.vence)} ${v.l.vence < today() ? chip('Vencido', 'bad') : chip(daysBetween(today(), v.l.vence) + ' d', 'warn')}</td></tr>`).join('')}</tbody></table></div>` : '';
+    const vencHTML = expiryBlock(items, 8);
     return seg + (costos && !hasPrices ? `<div class="note">Los valores en ${cfg().moneda} (compras, ventas, utilidad, valor del inventario) se calculan con el <b>costo</b> y <b>precio</b> de cada artículo. Complétalos en Inventario → Editar para ver esos indicadores.</div>` : '') +
       `<div class="kpis">${kp}</div>
      <div class="cols2"><div class="card"><h3>Ingresos vs. egresos <small>${esc(periodLabel())} · unidades</small></h3><div class="chartbox"><canvas id="ch-flow"></canvas></div></div>
        <div class="card"><h3>Salud del inventario <small>artículos por estado</small></h3><div class="chartbox"><canvas id="ch-est"></canvas></div></div></div>
      <div class="cols3"><div class="card"><h3>Mayor salida en el periodo <small>unidades</small></h3><div class="chartbox sm"><canvas id="ch-top"></canvas></div></div>
        <div class="card"><h3>Alertas de reposición ${can('solicitud') && alerts.length ? `<span class="row" style="gap:6px">${nProd ? `<button class="btn sm pri" data-act="reqAlerts" data-t="producto">${ic('send')} Solicitar productos (${nProd})</button>` : ''}${nIns ? `<button class="btn sm pri" data-act="reqAlerts" data-t="insumo">${ic('send')} Solicitar insumos (${nIns})</button>` : ''}</span>` : ''}</h3>
-       ${alertRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Exist.</th><th class="r">Mín.</th><th>Estado</th><th class="r">Sugerido</th></tr></thead><tbody>${alertRows}</tbody></table></div>${alerts.length > 9 ? `<small class="mut">+${alerts.length - 9} más en el reporte «Pedido sugerido»</small>` : ''}` : '<div class="empty"><b>Todo en orden</b>No hay artículos por reponer.</div>'}${vencHTML}</div></div>
-     ${pendHTML}
+       ${alertRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Exist.</th><th class="r">Mín.</th><th>Estado</th><th class="r">Sugerido</th></tr></thead><tbody>${alertRows}</tbody></table></div>${alerts.length > 9 ? `<small class="mut">+${alerts.length - 9} más en el reporte «Pedido sugerido»</small>` : ''}` : '<div class="empty"><b>Todo en orden</b>No hay artículos por reponer.</div>'}</div></div>
+     ${vencHTML}${pendHTML}
      <div class="card"><h3>Tiempo de uso y cobertura <small>según el consumo de los últimos ${cfg().ventanaConsumo} días</small><button class="btn sm" data-act="go" data-page="reportes" data-rep="consumo">Ver reporte completo</button></h3>
        ${usoRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Consumo/día</th><th>Cobertura (días)</th><th>Se agota aprox.</th><th class="r" title="Días promedio que tarda en agotarse cada ingreso (método PEPS)">Vida prom. de lote (días)</th><th class="r" title="Días promedio entre abrir y terminar una unidad">Duración de 1 unidad (días)</th></tr></thead><tbody>${usoRows}</tbody></table></div>` : '<div class="empty">Aún no hay consumo suficiente para estimar la duración.</div>'}</div>`;
   },
   mount() {
-    if (!window.Chart || !ix().items.length) return; chartDefaults();
+    if (simpleDash() || !window.Chart || !ix().items.length) return; chartDefaults();
     const { from, to } = periodRange();
     const items = ix().items.filter(i => i.activo !== false && (S.scope === 'todo' || i.tipo === S.scope));
     // flujo
@@ -1032,14 +1096,14 @@ S.invQ = ''; S.invCat = ''; S.invEst = ''; S.invArch = false;
 function invRows() {
   const q = norm(S.invQ);
   return ix().items.filter(i => i.tipo === S.invTab && (S.invArch || i.activo !== false) && (!S.invCat || i.catId === S.invCat) && (!q || norm(i.nombre + ' ' + (i.codigo || '')).includes(q)))
-    .map(it => ({ it, st: itemStatus(it) })).filter(r => !S.invEst || r.st.est === S.invEst).sort((a, b) => a.it.nombre.localeCompare(b.it.nombre, 'es'));
+    .map(it => ({ it, st: itemStatus(it), ex: nextExpiry(it.id) })).filter(r => !S.invEst || (S.invEst === 'Por vencer' ? !!r.ex : r.st.est === S.invEst)).sort((a, b) => a.it.nombre.localeCompare(b.it.nombre, 'es'));
 }
 function invDS() {
   const costos = can('costos');
   const ins = S.invTab === 'insumo';
   const cols = [{ t: 'Código', k: r => r.it.codigo || '' }, { t: 'Artículo', k: r => r.it.nombre }, { t: ins ? 'Área' : 'Categoría', k: r => catName(r.it.catId) }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Existencia', k: r => r.st.st, n: 1, d: 0 },
   ...(ins ? [{ t: 'Sellado', k: r => unitState(r.it.id).sellado, n: 1 }, { t: 'En uso', k: r => unitState(r.it.id).uso, n: 1 }, { t: 'En camino', k: r => r.st.camino || '', n: 1 }] : []),
-  { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 2 }, { t: 'Origen del consumo', k: r => r.st.u.origen }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, ...(ins ? [{ t: 'Duración de 1 unidad (días)', k: r => unitCycles(r.it.id).avg ?? '', n: 1, d: 1 }] : []), { t: 'Estado', k: r => r.st.est }];
+  { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 2 }, { t: 'Origen del consumo', k: r => r.st.u.origen }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, ...(ins ? [{ t: 'Duración de 1 unidad (días)', k: r => unitCycles(r.it.id).avg ?? '', n: 1, d: 1 }] : []), { t: 'Estado', k: r => r.st.est }, { t: 'Próximo vencimiento', k: r => r.ex ? fmtDate(r.ex.l.vence) + ' (' + r.ex.e.txt + ')' : '' }];
   if (costos) cols.push({ t: 'Costo', k: r => r.it.costo, n: 1, d: 2 }, { t: 'Precio', k: r => r.it.precio, n: 1, d: 2 }, { t: 'Valor al costo', k: r => Math.max(0, r.st.st) * r.it.costo, n: 1, d: 2 });
   const rows = invRows();
   return { title: S.invTab === 'producto' ? 'Inventario de productos para venta' : 'Inventario de insumos', sub: 'Existencias al ' + fmtDate(today()) + ' · ' + rows.length + ' artículos', cols, rows, foot: { 'Artículo': 'TOTAL', 'Existencia': rows.reduce((a, r) => a + r.st.st, 0), ...(costos ? { 'Valor al costo': rows.reduce((a, r) => a + Math.max(0, r.st.st) * r.it.costo, 0) } : {}) } };
@@ -1049,13 +1113,14 @@ function invTable() {
   const rows = invRows(), costos = can('costos'), ins = S.invTab === 'insumo';
   if (!rows.length) return `<div class="empty"><b>Sin artículos</b>${S.invQ || S.invCat || S.invEst ? 'Prueba quitando los filtros.' : (can('catalogo') ? 'Pulsa «Nuevo artículo» para crear el primero.' : '')}</div>`;
   const origen = u => u.origen === 'estimado' ? ' <small class="mut" title="Estimado inicial: se reemplaza automáticamente con el consumo real">est.</small>' : u.origen === 'mixto' ? ' <small class="mut" title="Mezcla de estimado inicial y consumo real">mix</small>' : '';
-  const body = rows.map(({ it, st }) => { const un = ins ? unitState(it.id) : null; return `<tr${it.activo === false ? ' style="opacity:.5"' : ''}><td>${esc(it.codigo || '')}</td><td><b>${esc(it.nombre)}</b>${it.activo === false ? ' <small>(archivado)</small>' : ''}<br><small class="mut">${esc(catName(it.catId))}${it.ubicacion ? ' · ' + esc(it.ubicacion) : ''}</small></td>
+  const hasExp = rows.some(r => r.ex);
+  const body = rows.map(({ it, st, ex }) => { const un = ins ? unitState(it.id) : null; return `<tr${it.activo === false ? ' style="opacity:.5"' : ''}><td>${esc(it.codigo || '')}</td><td><b>${esc(it.nombre)}</b>${it.activo === false ? ' <small>(archivado)</small>' : ''}<br><small class="mut">${esc(catName(it.catId))}${it.ubicacion ? ' · ' + esc(it.ubicacion) : ''}</small></td>
     <td class="r"><b>${fmtQty(st.st)}</b> <small class="mut">${esc(it.unidad)}</small>${st.camino ? `<br><small class="chip info" title="Solicitado y aún sin recibir">+${fmtQty(st.camino)} en camino</small>` : ''}</td>
     ${ins ? `<td class="r">${fmtQty(un.sellado)}</td><td class="r">${fmtQty(un.uso)}</td>` : ''}<td class="r">${st.min || '—'}${it.min > 0 ? '' : st.min ? ' <small class="mut" title="Mínimo calculado según consumo">auto</small>' : ''}</td>
-    <td class="r">${fmtN(st.u.perDay, st.u.perDay < 1 ? 2 : 1)}${origen(st.u)}</td><td class="r">${st.cov === null ? '—' : fmtN(st.cov, 1) + ' d'}</td><td>${statusChip(st)}</td>
+    <td class="r">${fmtN(st.u.perDay, st.u.perDay < 1 ? 2 : 1)}${origen(st.u)}</td><td class="r">${st.cov === null ? '—' : fmtN(st.cov, 1) + ' d'}</td><td>${statusChip(st)}</td>${hasExp ? `<td>${ex ? expChip(ex.e, ex.l) : '<span class="mut">—</span>'}</td>` : ''}
     ${costos ? `<td class="r">${it.costo ? fmtN(it.costo, 2) : '—'}</td>${S.invTab === 'producto' ? `<td class="r">${it.precio ? fmtN(it.precio, 2) : '—'}</td>` : ''}<td class="r">${it.costo ? fmtN(Math.max(0, st.st) * it.costo, 2) : '—'}</td>` : ''}
     <td><div class="act">${can('mov') ? `<button class="btn sm icon-btn" title="Registrar ingreso" data-act="movFor" data-id="${it.id}" data-d="in">${ic('plus')}</button>${ins ? `<button class="btn sm" title="Pasar una unidad de Sellado a En uso" data-act="unitOpen" data-id="${it.id}">Abrir</button><button class="btn sm" title="Dar una unidad por terminada (sale del inventario)" data-act="unitDone" data-id="${it.id}">Terminar</button>` : ''}<button class="btn sm icon-btn" title="Registrar egreso" data-act="movFor" data-id="${it.id}" data-d="out" style="font-weight:900">−</button>` : ''}<button class="btn sm icon-btn" title="Historial y tiempo de uso" data-act="kardex" data-id="${it.id}">${ic('clock')}</button>${can('catalogo') ? `<button class="btn sm icon-btn" title="Editar" data-act="editItem" data-id="${it.id}">${ic('edit')}</button>` : ''}</div></td></tr>`; }).join('');
-  return `<div class="tw"><table><thead><tr><th>Código</th><th>Artículo</th><th class="r">Existencia</th>${ins ? '<th class="r" title="Unidades nuevas, sin abrir">Sellado</th><th class="r" title="Unidades abiertas, en uso">En uso</th>' : ''}<th class="r">Mínimo</th><th class="r">Consumo/día</th><th class="r">Cobertura</th><th>Estado</th>${costos ? `<th class="r">Costo</th>${S.invTab === 'producto' ? '<th class="r">Precio</th>' : ''}<th class="r">Valor</th>` : ''}<th></th></tr></thead><tbody>${body}</tbody></table></div>`;
+  return `<div class="tw"><table><thead><tr><th>Código</th><th>Artículo</th><th class="r">Existencia</th>${ins ? '<th class="r" title="Unidades nuevas, sin abrir">Sellado</th><th class="r" title="Unidades abiertas, en uso">En uso</th>' : ''}<th class="r">Mínimo</th><th class="r">Consumo/día</th><th class="r">Cobertura</th><th>Estado</th>${hasExp ? '<th title="Lote con existencia que vence primero">Vencimiento</th>' : ''}${costos ? `<th class="r">Costo</th>${S.invTab === 'producto' ? '<th class="r">Precio</th>' : ''}<th class="r">Valor</th>` : ''}<th></th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 PAGES.inventario = {
   title: 'Inventario',
@@ -1064,7 +1129,7 @@ PAGES.inventario = {
     return `<div class="tabs"><button data-act="invtab" data-t="producto" class="${S.invTab === 'producto' ? 'on' : ''}">Productos para venta (${n('producto')})</button><button data-act="invtab" data-t="insumo" class="${S.invTab === 'insumo' ? 'on' : ''}">Insumos (${n('insumo')})</button></div>
     <div class="tools"><input class="search" id="invq" placeholder="Buscar por nombre o código…" value="${esc(S.invQ)}" data-input="invq">
       <select data-change="invcat">${catOptions(S.invCat, S.invTab).replace('— Sin categoría —', 'Todas las categorías')}</select>
-      <select data-change="invest"><option value="">Todos los estados</option>${['OK', 'Por agotarse', 'Bajo mínimo', 'Agotado', 'Sin movimiento'].map(e => `<option ${S.invEst === e ? 'selected' : ''}>${e}</option>`).join('')}</select>
+      <select data-change="invest"><option value="">Todos los estados</option>${['OK', 'Por agotarse', 'Bajo mínimo', 'Agotado', 'Sin movimiento', 'Por vencer'].map(e => `<option ${S.invEst === e ? 'selected' : ''}>${e}</option>`).join('')}</select>
       <label style="display:flex;gap:6px;align-items:center;margin:0;font-weight:500"><input type="checkbox" style="width:auto" ${S.invArch ? 'checked' : ''} data-change="invarch"> archivados</label>
       <span class="sp"></span>${expBtns('inv')}${can('catalogo') ? `<button class="btn pri" data-act="newItem">${ic('plus')} Nuevo artículo</button>` : ''}</div>
     <div id="invtable">${invTable()}</div>`;
@@ -1505,7 +1570,7 @@ ACT.reqReceive = el => {
   openModal({
     title: 'Registrar recepción · ' + esc(r.folio), size: 'mid',
     body: `<form id="recform" data-submit="rec" data-id="${r.id}"><div class="grid g3"><div class="fld"><label>Fecha de recepción</label><input type="date" name="fecha" value="${today()}" min="${r.fecha}" max="${today()}"></div><div class="fld"><label>Documento / factura</label><input name="doc"></div><div class="fld"><label>Proveedor</label><select name="provId">${provOptions(r.provId)}</select></div></div>
-    <div class="tw"><table class="lines"><thead><tr><th>Artículo</th><th class="r">Pedido</th><th class="r">Ya recibido</th><th class="r">Recibido hoy</th>${costos ? '<th class="r">Costo unit.</th>' : ''}<th title="Marca si lo que falta ya no llegará">Cerrar lo pendiente</th></tr></thead><tbody>${r.lines.map(l => { const pend = Math.max(0, l.cant - (l.recCant || 0)); return `<tr data-id="${l.itemId}"><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r">${fmtQty(l.recCant || 0)}</td><td class="r"><input class="q" name="rec" type="number" min="0" step="any" value="${l.cerrada ? 0 : pend}"</td>${costos ? `<td class="r"><input class="q" name="costo" type="number" min="0" step="any" value="${itemById(l.itemId)?.costo || ''}"></td>` : ''}<td style="text-align:center"><input type="checkbox" name="cerrar" style="width:auto" ${l.cerrada ? 'checked' : ''}></td></tr>`; }).join('')}</tbody></table></div>
+    <div class="tw"><table class="lines"><thead><tr><th>Artículo</th><th class="r">Pedido</th><th class="r">Ya recibido</th><th class="r">Recibido hoy</th>${costos ? '<th class="r">Costo unit.</th>' : ''}<th title="Opcional: fecha de vencimiento del lote que llega">Vence</th><th title="Marca si lo que falta ya no llegará">Cerrar lo pendiente</th></tr></thead><tbody>${r.lines.map(l => { const pend = Math.max(0, l.cant - (l.recCant || 0)); return `<tr data-id="${l.itemId}"><td>${esc(l.nombre)}</td><td class="r">${fmtQty(l.cant)}</td><td class="r">${fmtQty(l.recCant || 0)}</td><td class="r"><input class="q" name="rec" type="number" min="0" step="any" value="${l.cerrada ? 0 : pend}"</td>${costos ? `<td class="r"><input class="q" name="costo" type="number" min="0" step="any" value="${itemById(l.itemId)?.costo || ''}"></td>` : ''}<td><input type="date" name="vence" style="width:135px"></td><td style="text-align:center"><input type="checkbox" name="cerrar" style="width:auto" ${l.cerrada ? 'checked' : ''}></td></tr>`; }).join('')}</tbody></table></div>
     <small class="mut">Se crearán los ingresos en el inventario con la fecha indicada y quedará registrado cuántos días tardó cada artículo.</small>
     <div class="mf" style="padding:12px 0 0;border:0"><button type="button" class="btn" data-act="mclose">Cancelar</button><button class="btn pri">Registrar ingreso</button></div></form>`,
   });
@@ -1515,6 +1580,7 @@ SUB.rec = f => {
   { const er = chkDate(fecha, { label: 'La fecha de recepción', min: r.fecha }); if (er) return toast(er, 'bad'); }
   const rows = $$('tbody tr', f).map(tr => ({ tr, l: r.lines.find(x => x.itemId === tr.dataset.id), it: itemById(tr.dataset.id), q: num(tr.querySelector('[name=rec]').value), cerrar: tr.querySelector('[name=cerrar]').checked }));
   { const er = rows.filter(x => x.q > 0).map(x => chkQty(x.q, 'La cantidad recibida de ' + x.l.nombre)).find(Boolean); if (er) return toast(er, 'bad'); }
+  { const bv = rows.find(x => x.q > 0 && (x.tr.querySelector('[name=vence]')?.value || '9999') < fecha); if (bv) return toast(`La fecha de vencimiento de ${bv.l.nombre} es anterior a la de recepción.`, 'bad'); }
   const exceso = rows.find(x => x.q > 0 && (x.l.recCant || 0) + x.q > x.l.cant * 1.5 + 1e-9);
   if (!rows.some(x => x.q > 0) && !rows.some(x => x.cerrar && !x.l.cerrada)) return toast('Escribe al menos una cantidad recibida', 'bad');
   const go = () => {
@@ -1522,7 +1588,7 @@ SUB.rec = f => {
     const lines = r.lines.map(l => { const x = rows.find(y => y.l === l); if (!x) return l; const nl = { ...l };
       if (x.q > 0) { nl.recCant = (l.recCant || 0) + x.q; nl.recFecha = fecha; }
       nl.cerrada = x.cerrar && nl.cant > (nl.recCant || 0); return nl; });
-    rows.forEach(x => { if (x.q > 0 && x.it) { const c = num(x.tr.querySelector('[name=costo]')?.value) || x.it.costo; put('movements', mkMove({ itemId: x.it.id, dir: 'in', tipo: 'compra', cant: x.q, fecha, doc: f.elements.doc.value || r.folio, provId: f.elements.provId.value, reqId: r.id, src: 'solicitud', costoU: c, nota: 'Recepción de ' + r.folio })); if (c > 0 && c !== x.it.costo && can('costos')) put('items', { ...x.it, costo: c }); n++; } });
+    rows.forEach(x => { if (x.q > 0 && x.it) { const c = num(x.tr.querySelector('[name=costo]')?.value) || x.it.costo; put('movements', mkMove({ itemId: x.it.id, dir: 'in', tipo: 'compra', cant: x.q, fecha, doc: f.elements.doc.value || r.folio, provId: f.elements.provId.value, reqId: r.id, src: 'solicitud', costoU: c, vence: x.tr.querySelector('[name=vence]')?.value || '', nota: 'Recepción de ' + r.folio })); if (c > 0 && c !== x.it.costo && can('costos')) put('items', { ...x.it, costo: c }); n++; } });
     const full = lines.every(l => (l.recCant || 0) >= l.cant || l.cerrada);
     put('requests', { ...r, lines, estado: full ? 'Recibida' : 'Parcial', recibida: fecha }); log('Recepción de solicitud', `${r.folio} · ${n} artículos`);
     closeModal(); toast('Ingreso registrado en el inventario', 'ok'); render();
@@ -1555,7 +1621,7 @@ const REP = {
     },
   },
   inventario: {
-    n: 'Inventario actual', d: 'Existencias, estado y valor al costo de hoy', noPeriod: true,
+    n: 'Inventario actual', get d() { return can('costos') ? 'Existencias, estado y valor al costo de hoy' : 'Existencias y estado de hoy'; }, noPeriod: true,
     build() {
       const costos = can('costos'), rows = repItems().map(it => ({ it, st: itemStatus(it) }));
       const cols = [{ t: 'Código', k: r => r.it.codigo || '' }, { t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Categoría', k: r => catName(r.it.catId) }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Estado', k: r => r.st.est }, { t: 'Ubicación', k: r => r.it.ubicacion || '' }];
@@ -1589,6 +1655,14 @@ const REP = {
     build() {
       const rows = repItems().map(it => ({ it, st: itemStatus(it) })).filter(r => NEEDS.includes(r.st.est)).map(r => ({ ...r, q: suggestQty(r.it, r.st) }));
       return { title: 'Pedido sugerido', sub: `Al ${fmtDate(today())} · objetivo: ${cfg().diasObjetivo} días de cobertura o stock máximo del artículo`, cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Existencia', k: r => r.st.st, n: 1 }, { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 1 }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, { t: 'Estado', k: r => r.st.est }, { t: 'En camino', k: r => r.st.camino || '', n: 1 }, { t: 'Cantidad sugerida', k: r => r.q, n: 1 }, { t: 'Proveedor', k: r => provName(r.it.provId) }], rows };
+    },
+  },
+  vencimientos: {
+    n: 'Próximos a vencer', d: 'Lotes con existencia que ya vencieron o vencen pronto (según los días de aviso de Configuración)', noPeriod: true,
+    build() {
+      const rows = expiryAlerts().filter(a => S.repTipo === 'todo' || a.it.tipo === S.repTipo);
+      return { title: 'Productos próximos a vencer', sub: `Al ${fmtDate(today())} · aviso con ${cfg().diasVencer || 30} días de anticipación · ${rows.filter(r => r.e.k === 'vencido').length} vencido(s)`,
+        cols: [{ t: 'Artículo', k: r => r.it.nombre }, { t: 'Tipo', k: r => r.it.tipo === 'insumo' ? 'Insumo' : 'Producto' }, { t: 'Categoría', k: r => catName(r.it.catId) }, { t: 'Ingresó', k: r => fmtDate(r.l.fecha) }, { t: 'Quedan', k: r => r.l.rest, n: 1 }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Vence', k: r => fmtDate(r.l.vence) }, { t: 'Días', k: r => r.e.dias, n: 1 }, { t: 'Aviso', k: r => r.e.k === 'vencido' ? 'Vencido' : r.e.k === 'urgente' ? 'Urgente' : 'Por vencer' }, { t: 'Ubicación', k: r => r.it.ubicacion || '' }], rows };
     },
   },
   flujo: {
@@ -1700,7 +1774,7 @@ const CFG = {
     return `<form class="card" data-submit="cfg" style="max-width:820px"><div class="grid g3"><div class="fld"><label>Nombre de la empresa</label><input name="empresa" value="${esc(c.empresa)}"></div><div class="fld"><label>Sucursal / ubicación</label><input name="sucursal" value="${esc(c.sucursal)}"></div><div class="fld"><label>Símbolo de moneda</label><input name="moneda" value="${esc(c.moneda)}" maxlength="4"></div></div>
     <div class="grid g2"><div class="fld"><label>Nombre del turno AM</label><input name="turnoAM" value="${esc(c.turnoAM)}"></div><div class="fld"><label>Nombre del turno PM</label><input name="turnoPM" value="${esc(c.turnoPM)}"></div></div>
     <h3 class="mb mt">Parámetros de reposición</h3><div class="grid g3"><div class="fld"><label>Ventana para calcular consumo (días)</label><input name="ventanaConsumo" type="number" min="7" max="365" value="${c.ventanaConsumo}"></div><div class="fld"><label>Alertar cuando queden menos de (días)</label><input name="diasReposicion" type="number" min="1" max="90" value="${c.diasReposicion}"></div><div class="fld"><label>Pedir hasta cubrir (días)</label><input name="diasObjetivo" type="number" min="1" max="180" value="${c.diasObjetivo}"></div></div>
-    <div class="grid g3"><div class="fld"><label>Días de espera antes de marcar una solicitud como «tarde»</label><input name="diasEspera" type="number" min="1" max="90" value="${c.diasEspera || 7}"></div><div class="fld"><label>Días a cubrir en el cierre de mes</label><input name="diasCierre" type="number" min="7" max="90" value="${c.diasCierre || 30}"></div></div>
+    <div class="grid g3"><div class="fld"><label>Días de espera antes de marcar una solicitud como «tarde»</label><input name="diasEspera" type="number" min="1" max="90" value="${c.diasEspera || 7}"></div><div class="fld"><label>Días a cubrir en el cierre de mes</label><input name="diasCierre" type="number" min="7" max="90" value="${c.diasCierre || 30}"></div><div class="fld"><label>Avisar productos por vencer con (días de anticipación)</label><input name="diasVencer" type="number" min="1" max="365" value="${c.diasVencer || 30}"></div></div>
     <small class="mut">Si un artículo no tiene stock mínimo, el sistema usa: consumo diario × días de alerta. El pedido sugerido llega hasta el stock máximo del artículo o, si no lo tiene, hasta cubrir los días objetivo.</small>
     <h3 class="mb mt">Solicitudes por WhatsApp y correo</h3><div class="grid g3"><div class="fld"><label>WhatsApp por defecto (con o sin 502)</label><input name="waDefault" value="${esc(c.waDefault)}" placeholder="5555 1234"></div><div class="fld"><label>Correo por defecto</label><input name="emailDefault" type="email" value="${esc(c.emailDefault)}"></div><div class="fld"><label>Código de país</label><input name="pais" value="${esc(c.pais)}"></div></div>
     <div class="row mt"><span class="sp"></span><button class="btn pri">Guardar configuración</button></div></form>`;
@@ -1738,8 +1812,8 @@ const CFG = {
   },
 };
 SUB.cfg = f => {
-  const g = n => f.elements[n].value; const c = { ...cfg(), empresa: g('empresa').trim() || 'EMPORIO', sucursal: g('sucursal').trim(), moneda: g('moneda').trim() || 'Q', turnoAM: g('turnoAM').trim() || 'Turno AM', turnoPM: g('turnoPM').trim() || 'Turno PM', ventanaConsumo: Math.max(7, num(g('ventanaConsumo')) || 30), diasReposicion: Math.max(1, num(g('diasReposicion')) || 7), diasObjetivo: Math.max(1, num(g('diasObjetivo')) || 14), diasEspera: Math.max(1, num(g('diasEspera')) || 7), diasCierre: Math.max(7, num(g('diasCierre')) || 30), waDefault: g('waDefault').trim(), emailDefault: g('emailDefault').trim(), pais: g('pais').replace(/\D/g, '') || '502', u: Date.now() };
-  DB.settings = c; commit(); log('Configuración', 'Parámetros actualizados'); toast('Configuración guardada', 'ok'); render();
+  const g = n => f.elements[n].value; const c = { ...cfg(), empresa: g('empresa').trim() || 'EMPORIO', sucursal: g('sucursal').trim(), moneda: g('moneda').trim() || 'Q', turnoAM: g('turnoAM').trim() || 'Turno AM', turnoPM: g('turnoPM').trim() || 'Turno PM', ventanaConsumo: Math.max(7, num(g('ventanaConsumo')) || 30), diasReposicion: Math.max(1, num(g('diasReposicion')) || 7), diasObjetivo: Math.max(1, num(g('diasObjetivo')) || 14), diasEspera: Math.max(1, num(g('diasEspera')) || 7), diasCierre: Math.max(7, num(g('diasCierre')) || 30), diasVencer: Math.max(1, num(g('diasVencer')) || 30), waDefault: g('waDefault').trim(), emailDefault: g('emailDefault').trim(), pais: g('pais').replace(/\D/g, '') || '502', u: Date.now() };
+  DB.settings = c; _expKey = null; commit(); log('Configuración', 'Parámetros actualizados'); toast('Configuración guardada', 'ok'); render();
 };
 /* categorías / proveedores */
 function openCat(id) {
@@ -1990,8 +2064,13 @@ function updateBanner() {
   let h = '';
   if (C.authErr) h = `<div class="note bad row">Tu sesión venció. Tus cambios están guardados en este dispositivo. <button class="btn sm pri" data-act="logout">Iniciar sesión de nuevo</button></div>`;
   else if (C.online === false) h = `<div class="note warn">Sin conexión: puedes seguir registrando. Se enviará todo automáticamente cuando vuelva el internet${C.pending ? ` (${C.pending} pendiente${C.pending > 1 ? 's' : ''})` : ''}.</div>`;
+  if (S.user && DB && ix().items.length && S.page !== 'inventario') {
+    const urg = expiryAlerts().filter(a => a.e.k === 'vencido' || a.e.k === 'urgente'), venc = urg.filter(a => a.e.k === 'vencido').length;
+    if (urg.length) h += `<div class="note bad row" style="align-items:center">⏰ <span><b>${venc ? venc + ' lote(s) vencido(s)' : ''}${venc && urg.length > venc ? ' y ' : ''}${urg.length > venc ? (urg.length - venc) + ' por vencer en 7 días o menos' : ''}</b> — ${esc(urg.slice(0, 3).map(a => a.it.nombre).join(', '))}${urg.length > 3 ? '…' : ''}</span><span class="sp"></span><button class="btn sm pri" data-act="expGo">Ver</button></div>`;
+  }
   b.innerHTML = h;
 }
+ACT.expGo = () => { S.invEst = 'Por vencer'; S.invQ = ''; S.invCat = ''; const a = expiryAlerts()[0]; if (a) S.invTab = a.it.tipo; go('inventario'); };
 
 /* ----- arranque ----- */
 function registerSW() { if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => { }); }

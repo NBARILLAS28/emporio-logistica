@@ -36,6 +36,7 @@ const UNIDADES = ['unidad', 'botella', 'lata', 'caja', 'paquete', 'bolsa', 'gal�
 const ROLES = {
   admin: { n: 'Administrador', d: 'Control total: usuarios, configuración, respaldo y todo lo demás.', p: ['ver', 'mov', 'turno', 'catalogo', 'ajuste', 'solicitud', 'reportes', 'costos', 'anular', 'usuarios', 'config', 'respaldo'] },
   supervisor: { n: 'Supervisor', d: 'Administra el inventario, aprueba ajustes y ve costos. No gestiona usuarios.', p: ['ver', 'mov', 'turno', 'catalogo', 'ajuste', 'solicitud', 'reportes', 'costos', 'anular'] },
+  encargado: { n: 'Encargado', simple: true, d: 'Igual que Supervisor (inventario, ajustes, conteos, solicitudes, anular) pero sin costos ni dinero en ninguna pantalla. Tablero simple: existencias, agotados y por agotarse.', p: ['ver', 'mov', 'turno', 'catalogo', 'ajuste', 'solicitud', 'reportes', 'anular'] },
   operador: { n: 'Operador / Bodega', d: 'Registra ingresos, egresos y cierres de turno; crea solicitudes. No ve costos ni edita el catálogo.', p: ['ver', 'mov', 'turno', 'solicitud', 'reportes'] },
   consulta: { n: 'Solo consulta', d: 'Puede ver el tablero, inventario y reportes. No modifica nada.', p: ['ver', 'reportes'] },
 };
@@ -48,7 +49,7 @@ const PERM_LABEL = {
 const DEFAULT_SETTINGS = {
   empresa: 'EMPORIO', sucursal: 'Chimaltenango', moneda: 'Q',
   turnoAM: 'Turno AM (5:00)', turnoPM: 'Turno PM (2:00)',
-  ventanaConsumo: 30, diasReposicion: 7, diasObjetivo: 14, diasEspera: 7, diasCierre: 30,
+  ventanaConsumo: 30, diasReposicion: 7, diasObjetivo: 14, diasEspera: 7, diasCierre: 30, diasVencer: 30,
   waDefault: '', emailDefault: '', pais: '502', u: 0,
 };
 const COLS = ['users', 'categories', 'suppliers', 'items', 'movements', 'requests', 'counts', 'audit'];
@@ -348,6 +349,34 @@ function suggestQty(it, s) {
   return q;
 }
 const NEEDS = ['Agotado', 'Bajo mínimo', 'Por agotarse'];
+
+/* Vencimientos: lotes con existencia que vencen dentro de «diasVencer» días (o ya vencidos) */
+const simpleDash = () => !!(S.user && ROLES[S.user.rol]?.simple);
+function expState(vence) {
+  if (!vence) return null;
+  const d = daysBetween(today(), vence), lim = cfg().diasVencer || 30;
+  if (d < 0) return { k: 'vencido', cls: 'bad', dias: d, txt: 'Vencido hace ' + (-d) + ' d' };
+  if (d <= 7) return { k: 'urgente', cls: 'bad', dias: d, txt: d === 0 ? 'Vence hoy' : 'Vence en ' + d + ' d' };
+  if (d <= lim) return { k: 'proximo', cls: 'warn', dias: d, txt: 'Vence en ' + d + ' d' };
+  return { k: 'ok', cls: 'ok', dias: d, txt: 'Vence ' + fmtDate(vence) };
+}
+let _expKey = null, _expVal = null;
+function expiryAlerts() { // [{it, l, e}] ordenado por fecha de vencimiento; se recalcula solo cuando cambian los datos
+  const key = ix();
+  if (_expKey === key && _expVal) return _expVal;
+  const out = [];
+  for (const it of key.items) {
+    if (it.activo === false) continue;
+    for (const l of lotsOf(it.id).lots) {
+      if (l.rest > 0 && l.vence) { const e = expState(l.vence); if (e.k !== 'ok') out.push({ it, l, e }); }
+    }
+  }
+  out.sort((a, b) => a.l.vence.localeCompare(b.l.vence));
+  _expKey = key; _expVal = out; return out;
+}
+/* primer vencimiento (más próximo) con existencia de un artículo */
+function nextExpiry(id) { const a = expiryAlerts().find(x => x.it.id === id); return a || null; }
+const expChip = (e, l) => e ? `<span class="chip ${e.cls}" title="${l ? 'Quedan ' + fmtQty(l.rest) + ' · vence ' + fmtDate(l.vence) : ''}">${e.txt}</span>` : '';
 
 /* flujo ingresos / egresos por tramo de tiempo */
 function flowBuckets(from, to) {

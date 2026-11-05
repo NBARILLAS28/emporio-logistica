@@ -96,8 +96,13 @@ function updateBanner() {
   let h = '';
   if (C.authErr) h = `<div class="note bad row">Tu sesión venció. Tus cambios están guardados en este dispositivo. <button class="btn sm pri" data-act="logout">Iniciar sesión de nuevo</button></div>`;
   else if (C.online === false) h = `<div class="note warn">Sin conexión: puedes seguir registrando. Se enviará todo automáticamente cuando vuelva el internet${C.pending ? ` (${C.pending} pendiente${C.pending > 1 ? 's' : ''})` : ''}.</div>`;
+  if (S.user && DB && ix().items.length && S.page !== 'inventario') {
+    const urg = expiryAlerts().filter(a => a.e.k === 'vencido' || a.e.k === 'urgente'), venc = urg.filter(a => a.e.k === 'vencido').length;
+    if (urg.length) h += `<div class="note bad row" style="align-items:center">⏰ <span><b>${venc ? venc + ' lote(s) vencido(s)' : ''}${venc && urg.length > venc ? ' y ' : ''}${urg.length > venc ? (urg.length - venc) + ' por vencer en 7 días o menos' : ''}</b> — ${esc(urg.slice(0, 3).map(a => a.it.nombre).join(', '))}${urg.length > 3 ? '…' : ''}</span><span class="sp"></span><button class="btn sm pri" data-act="expGo">Ver</button></div>`;
+  }
   b.innerHTML = h;
 }
+ACT.expGo = () => { S.invEst = 'Por vencer'; S.invQ = ''; S.invCat = ''; const a = expiryAlerts()[0]; if (a) S.invTab = a.it.tipo; go('inventario'); };
 
 /* ----- arranque ----- */
 function registerSW() { if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => { }); }

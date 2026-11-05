@@ -30,6 +30,7 @@ svg.i{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stro
 #nav{padding:6px 10px;flex:1;overflow:auto}
 #nav a{display:flex;gap:11px;align-items:center;padding:9px 11px;border-radius:9px;color:var(--sideink);text-decoration:none;margin-bottom:2px;cursor:pointer;opacity:.82}
 #nav a:hover{background:#1b1b20;opacity:1}
+#nav .navbadge{margin-left:auto;font-style:normal;font-size:11px;font-weight:800;background:#e0a31f;color:#1a1a1a;border-radius:99px;padding:1px 7px;min-width:20px;text-align:center}
 #nav a.on{background:var(--acc);color:#fff;opacity:1}
 #nav .sec{font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--sidemut);margin:14px 11px 5px}
 .who{padding:12px 14px;border-top:1px solid #222228;font-size:12.5px;display:flex;gap:10px;align-items:center}
@@ -97,6 +98,7 @@ label{display:block;font-size:12px;font-weight:600;color:var(--mut);margin-botto
 .kpi span{font-size:12px;color:var(--mut)}
 .cols2{display:grid;grid-template-columns:1.5fr 1fr;gap:12px;margin-bottom:12px}
 .cols3{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.cols2>*,.cols3>*{min-width:0}
 .chartbox{position:relative;height:270px}
 .chartbox.sm{height:240px}
 

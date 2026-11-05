@@ -14,9 +14,44 @@ ACT.exp = el => {
 const emptyCatalog = () => `<div class="card empty"><b>Aún no hay artículos</b>Crea tu primer artículo en <a href="#" data-act="go" data-page="inventario">Inventario</a> o impórtalos desde Excel en Configuración → Importar.</div>`;
 
 /* ---------------------------- TABLERO ---------------------------- */
+/* Bloque de vencimientos (todos los roles): lotes con existencia vencidos o por vencer */
+function expiryBlock(items, max = 8) {
+  const set = items ? new Set(items.map(i => i.id)) : null;
+  const al = expiryAlerts().filter(a => !set || set.has(a.it.id));
+  if (!al.length) return '';
+  const nV = al.filter(a => a.e.k === 'vencido').length;
+  return `<div class="card"><h3>Vencimientos <small>${nV ? nV + ' vencido(s) · ' : ''}${al.length - nV} por vencer en ${cfg().diasVencer || 30} días</small></h3>
+   <div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Quedan</th><th>Vence</th><th>Aviso</th></tr></thead><tbody>${al.slice(0, max).map(a => `<tr><td>${esc(a.it.nombre)}</td><td class="r">${fmtQty(a.l.rest)} <small class="mut">${esc(a.it.unidad)}</small></td><td>${fmtDate(a.l.vence)}</td><td>${expChip(a.e, a.l)}</td></tr>`).join('')}</tbody></table></div>${al.length > max ? `<small class="mut">+${al.length - max} más · filtra «Por vencer» en Inventario o abre el reporte «Próximos a vencer»</small>` : ''}</div>`;
+}
+/* Tablero simple (rol Encargado): solo existencias, agotados, por agotarse y vencimientos. Sin dinero. */
+function dashSimple() {
+  const items = ix().items.filter(i => i.activo !== false && (S.scope === 'todo' || i.tipo === S.scope));
+  const seg = `<div class="seg mb">${[['todo', 'Todo'], ['producto', 'Productos para venta'], ['insumo', 'Insumos']].map(([k, t]) => `<button data-act="scope" data-s="${k}" class="${S.scope === k ? 'on' : ''}">${t}</button>`).join('')}</div>`;
+  if (!ix().items.length) return seg + emptyCatalog();
+  const rows = items.map(it => ({ it, st: itemStatus(it) })).sort((a, b) => a.it.nombre.localeCompare(b.it.nombre, 'es'));
+  const agot = rows.filter(r => r.st.est === 'Agotado');
+  const prox = rows.filter(r => r.st.est === 'Bajo mínimo' || r.st.est === 'Por agotarse').sort((a, b) => (a.st.cov ?? 999) - (b.st.cov ?? 999));
+  const venc = expiryAlerts().filter(a => items.includes(a.it));
+  const kpi = (cls, lbl, val, sub) => `<div class="kpi ${cls}"><small>${lbl}</small><b>${val}</b><span>${sub}</span></div>`;
+  const kp = kpi('k-info', 'Existencia total', fmtQty(rows.reduce((a, r) => a + Math.max(0, r.st.st), 0)) + ' uds', rows.length + ' artículos activos')
+    + kpi('k-out', 'Agotados', agot.length, agot.length ? 'Sin existencia, hay que reponer' : 'Ninguno')
+    + kpi('k-warn', 'Próximos a agotarse', prox.length, 'Bajo el mínimo o con poca cobertura')
+    + kpi(venc.length ? 'k-out' : 'k-in', 'Por vencer / vencidos', venc.length, venc.length ? venc.filter(a => a.e.k === 'vencido').length + ' vencido(s)' : 'Todo vigente');
+  const reqBtn = tipo => { const n = [...agot, ...prox].filter(r => r.it.tipo === tipo).length; return can('solicitud') && n ? `<button class="btn sm pri" data-act="reqAlerts" data-t="${tipo}">${ic('send')} Solicitar ${tipo === 'insumo' ? 'insumos' : 'productos'} (${n})</button>` : ''; };
+  const line = (r, extra) => `<tr><td>${esc(r.it.nombre)} <small class="mut">${r.it.tipo === 'insumo' ? '· insumo' : ''}</small></td><td class="r"><b>${fmtQty(r.st.st)}</b> <small class="mut">${esc(r.it.unidad)}</small></td>${extra}</tr>`;
+  const tAgot = agot.length ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Mínimo</th><th>Pedido</th></tr></thead><tbody>${agot.map(r => line(r, `<td class="r">${r.st.min || '—'}</td><td>${r.st.camino ? `<span class="chip info">+${fmtQty(r.st.camino)} en camino</span>` : '<span class="mut">—</span>'}</td>`)).join('')}</tbody></table></div>` : '<div class="empty"><b>Sin agotados</b>Todos los artículos tienen existencia.</div>';
+  const tProx = prox.length ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Mínimo</th><th class="r">Alcanza</th><th>Estado</th></tr></thead><tbody>${prox.map(r => line(r, `<td class="r">${r.st.min || '—'}</td><td class="r">${r.st.cov === null ? '—' : fmtN(r.st.cov, 0) + ' d'}</td><td>${statusChip(r.st)}${r.st.camino ? ` <span class="chip info">+${fmtQty(r.st.camino)} en camino</span>` : ''}</td>`)).join('')}</tbody></table></div>` : '<div class="empty"><b>Todo en orden</b>Nada próximo a agotarse.</div>';
+  const tAll = `<div class="tw" style="max-height:480px;overflow:auto"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th>Estado</th></tr></thead><tbody>${rows.map(r => `<tr><td>${esc(r.it.nombre)} <small class="mut">${esc(catName(r.it.catId))}</small></td><td class="r"><b>${fmtQty(r.st.st)}</b> <small class="mut">${esc(r.it.unidad)}</small></td><td>${statusChip(r.st)}</td></tr>`).join('')}</tbody></table></div>`;
+  return seg + `<div class="kpis">${kp}</div>
+   <div class="cols2"><div class="card"><h3>Agotados <small>${agot.length}</small></h3>${tAgot}</div>
+    <div class="card"><h3>Próximos a agotarse <small>${prox.length}</small><span class="row" style="gap:6px">${reqBtn('producto')}${reqBtn('insumo')}</span></h3>${tProx}</div></div>
+   ${expiryBlock(items, 10)}
+   <div class="card"><h3>Existencias <small>${rows.length} artículos</small></h3>${tAll}</div>`;
+}
 PAGES.dashboard = {
   title: 'Tablero',
   html() {
+    if (simpleDash()) return dashSimple();
     const { from, to } = periodRange();
     const items = ix().items.filter(i => i.activo !== false && (S.scope === 'todo' || i.tipo === S.scope));
     const seg = `<div class="seg mb">${[['todo', 'Todo'], ['producto', 'Productos para venta'], ['insumo', 'Insumos']].map(([k, t]) => `<button data-act="scope" data-s="${k}" class="${S.scope === k ? 'on' : ''}">${t}</button>`).join('')}</div>`;
@@ -45,21 +80,20 @@ PAGES.dashboard = {
     const pend = pendingRequests(), lt = leadTimes();
     const pendHTML = pend.length ? `<div class="card"><h3>Solicitudes en espera <small>${pend.length} sin recibir completas${lt.med !== null ? ` · entrega típica: ${fmtN(lt.med, 0)} días` : ''}</small><button class="btn sm" data-act="go" data-page="solicitudes">Ver solicitudes</button></h3><div class="tw"><table><thead><tr><th>Folio</th><th>Fecha</th><th>Para</th><th class="r">Pendientes</th><th class="r">Espera</th></tr></thead><tbody>${pend.slice(0, 6).map(p => `<tr><td><b>${esc(p.r.folio)}</b></td><td>${fmtDate(p.r.fecha)}</td><td>${esc(p.r.destNombre || (p.r.tipo === 'insumo' ? 'Insumos' : 'Productos'))}</td><td class="r">${p.pend} art.</td><td class="r">${p.tarde ? chip(p.dias + ' d · tarde', 'bad') : chip(p.dias + ' d', 'info')}</td></tr>`).join('')}</tbody></table></div></div>` : '';
     const nProd = alerts.filter(r => r.it.tipo === 'producto').length, nIns = alerts.filter(r => r.it.tipo === 'insumo').length;
-    const venc = []; items.forEach(it => lotsOf(it.id).lots.forEach(l => { if (l.rest > 0 && l.vence && l.vence <= addDays(today(), 30)) venc.push({ it, l }); })); venc.sort((a, b) => a.l.vence.localeCompare(b.l.vence));
-    const vencHTML = venc.length ? `<h3 class="mt">Por vencer <small>próximos 30 días</small></h3><div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Quedan</th><th>Vence</th></tr></thead><tbody>${venc.slice(0, 6).map(v => `<tr><td>${esc(v.it.nombre)}</td><td class="r">${fmtQty(v.l.rest)}</td><td>${fmtDate(v.l.vence)} ${v.l.vence < today() ? chip('Vencido', 'bad') : chip(daysBetween(today(), v.l.vence) + ' d', 'warn')}</td></tr>`).join('')}</tbody></table></div>` : '';
+    const vencHTML = expiryBlock(items, 8);
     return seg + (costos && !hasPrices ? `<div class="note">Los valores en ${cfg().moneda} (compras, ventas, utilidad, valor del inventario) se calculan con el <b>costo</b> y <b>precio</b> de cada artículo. Complétalos en Inventario → Editar para ver esos indicadores.</div>` : '') +
       `<div class="kpis">${kp}</div>
      <div class="cols2"><div class="card"><h3>Ingresos vs. egresos <small>${esc(periodLabel())} · unidades</small></h3><div class="chartbox"><canvas id="ch-flow"></canvas></div></div>
        <div class="card"><h3>Salud del inventario <small>artículos por estado</small></h3><div class="chartbox"><canvas id="ch-est"></canvas></div></div></div>
      <div class="cols3"><div class="card"><h3>Mayor salida en el periodo <small>unidades</small></h3><div class="chartbox sm"><canvas id="ch-top"></canvas></div></div>
        <div class="card"><h3>Alertas de reposición ${can('solicitud') && alerts.length ? `<span class="row" style="gap:6px">${nProd ? `<button class="btn sm pri" data-act="reqAlerts" data-t="producto">${ic('send')} Solicitar productos (${nProd})</button>` : ''}${nIns ? `<button class="btn sm pri" data-act="reqAlerts" data-t="insumo">${ic('send')} Solicitar insumos (${nIns})</button>` : ''}</span>` : ''}</h3>
-       ${alertRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Exist.</th><th class="r">Mín.</th><th>Estado</th><th class="r">Sugerido</th></tr></thead><tbody>${alertRows}</tbody></table></div>${alerts.length > 9 ? `<small class="mut">+${alerts.length - 9} más en el reporte «Pedido sugerido»</small>` : ''}` : '<div class="empty"><b>Todo en orden</b>No hay artículos por reponer.</div>'}${vencHTML}</div></div>
-     ${pendHTML}
+       ${alertRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Exist.</th><th class="r">Mín.</th><th>Estado</th><th class="r">Sugerido</th></tr></thead><tbody>${alertRows}</tbody></table></div>${alerts.length > 9 ? `<small class="mut">+${alerts.length - 9} más en el reporte «Pedido sugerido»</small>` : ''}` : '<div class="empty"><b>Todo en orden</b>No hay artículos por reponer.</div>'}</div></div>
+     ${vencHTML}${pendHTML}
      <div class="card"><h3>Tiempo de uso y cobertura <small>según el consumo de los últimos ${cfg().ventanaConsumo} días</small><button class="btn sm" data-act="go" data-page="reportes" data-rep="consumo">Ver reporte completo</button></h3>
        ${usoRows ? `<div class="tw"><table><thead><tr><th>Artículo</th><th class="r">Existencia</th><th class="r">Consumo/día</th><th>Cobertura (días)</th><th>Se agota aprox.</th><th class="r" title="Días promedio que tarda en agotarse cada ingreso (método PEPS)">Vida prom. de lote (días)</th><th class="r" title="Días promedio entre abrir y terminar una unidad">Duración de 1 unidad (días)</th></tr></thead><tbody>${usoRows}</tbody></table></div>` : '<div class="empty">Aún no hay consumo suficiente para estimar la duración.</div>'}</div>`;
   },
   mount() {
-    if (!window.Chart || !ix().items.length) return; chartDefaults();
+    if (simpleDash() || !window.Chart || !ix().items.length) return; chartDefaults();
     const { from, to } = periodRange();
     const items = ix().items.filter(i => i.activo !== false && (S.scope === 'todo' || i.tipo === S.scope));
     // flujo
@@ -89,14 +123,14 @@ S.invQ = ''; S.invCat = ''; S.invEst = ''; S.invArch = false;
 function invRows() {
   const q = norm(S.invQ);
   return ix().items.filter(i => i.tipo === S.invTab && (S.invArch || i.activo !== false) && (!S.invCat || i.catId === S.invCat) && (!q || norm(i.nombre + ' ' + (i.codigo || '')).includes(q)))
-    .map(it => ({ it, st: itemStatus(it) })).filter(r => !S.invEst || r.st.est === S.invEst).sort((a, b) => a.it.nombre.localeCompare(b.it.nombre, 'es'));
+    .map(it => ({ it, st: itemStatus(it), ex: nextExpiry(it.id) })).filter(r => !S.invEst || (S.invEst === 'Por vencer' ? !!r.ex : r.st.est === S.invEst)).sort((a, b) => a.it.nombre.localeCompare(b.it.nombre, 'es'));
 }
 function invDS() {
   const costos = can('costos');
   const ins = S.invTab === 'insumo';
   const cols = [{ t: 'Código', k: r => r.it.codigo || '' }, { t: 'Artículo', k: r => r.it.nombre }, { t: ins ? 'Área' : 'Categoría', k: r => catName(r.it.catId) }, { t: 'Unidad', k: r => r.it.unidad }, { t: 'Existencia', k: r => r.st.st, n: 1, d: 0 },
   ...(ins ? [{ t: 'Sellado', k: r => unitState(r.it.id).sellado, n: 1 }, { t: 'En uso', k: r => unitState(r.it.id).uso, n: 1 }, { t: 'En camino', k: r => r.st.camino || '', n: 1 }] : []),
-  { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 2 }, { t: 'Origen del consumo', k: r => r.st.u.origen }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, ...(ins ? [{ t: 'Duración de 1 unidad (días)', k: r => unitCycles(r.it.id).avg ?? '', n: 1, d: 1 }] : []), { t: 'Estado', k: r => r.st.est }];
+  { t: 'Mínimo', k: r => r.st.min, n: 1 }, { t: 'Consumo/día', k: r => r.st.u.perDay, n: 1, d: 2 }, { t: 'Origen del consumo', k: r => r.st.u.origen }, { t: 'Cobertura (días)', k: r => r.st.cov === null ? '' : r.st.cov, n: 1, d: 1 }, ...(ins ? [{ t: 'Duración de 1 unidad (días)', k: r => unitCycles(r.it.id).avg ?? '', n: 1, d: 1 }] : []), { t: 'Estado', k: r => r.st.est }, { t: 'Próximo vencimiento', k: r => r.ex ? fmtDate(r.ex.l.vence) + ' (' + r.ex.e.txt + ')' : '' }];
   if (costos) cols.push({ t: 'Costo', k: r => r.it.costo, n: 1, d: 2 }, { t: 'Precio', k: r => r.it.precio, n: 1, d: 2 }, { t: 'Valor al costo', k: r => Math.max(0, r.st.st) * r.it.costo, n: 1, d: 2 });
   const rows = invRows();
   return { title: S.invTab === 'producto' ? 'Inventario de productos para venta' : 'Inventario de insumos', sub: 'Existencias al ' + fmtDate(today()) + ' · ' + rows.length + ' artículos', cols, rows, foot: { 'Artículo': 'TOTAL', 'Existencia': rows.reduce((a, r) => a + r.st.st, 0), ...(costos ? { 'Valor al costo': rows.reduce((a, r) => a + Math.max(0, r.st.st) * r.it.costo, 0) } : {}) } };
@@ -106,13 +140,14 @@ function invTable() {
   const rows = invRows(), costos = can('costos'), ins = S.invTab === 'insumo';
   if (!rows.length) return `<div class="empty"><b>Sin artículos</b>${S.invQ || S.invCat || S.invEst ? 'Prueba quitando los filtros.' : (can('catalogo') ? 'Pulsa «Nuevo artículo» para crear el primero.' : '')}</div>`;
   const origen = u => u.origen === 'estimado' ? ' <small class="mut" title="Estimado inicial: se reemplaza automáticamente con el consumo real">est.</small>' : u.origen === 'mixto' ? ' <small class="mut" title="Mezcla de estimado inicial y consumo real">mix</small>' : '';
-  const body = rows.map(({ it, st }) => { const un = ins ? unitState(it.id) : null; return `<tr${it.activo === false ? ' style="opacity:.5"' : ''}><td>${esc(it.codigo || '')}</td><td><b>${esc(it.nombre)}</b>${it.activo === false ? ' <small>(archivado)</small>' : ''}<br><small class="mut">${esc(catName(it.catId))}${it.ubicacion ? ' · ' + esc(it.ubicacion) : ''}</small></td>
+  const hasExp = rows.some(r => r.ex);
+  const body = rows.map(({ it, st, ex }) => { const un = ins ? unitState(it.id) : null; return `<tr${it.activo === false ? ' style="opacity:.5"' : ''}><td>${esc(it.codigo || '')}</td><td><b>${esc(it.nombre)}</b>${it.activo === false ? ' <small>(archivado)</small>' : ''}<br><small class="mut">${esc(catName(it.catId))}${it.ubicacion ? ' · ' + esc(it.ubicacion) : ''}</small></td>
     <td class="r"><b>${fmtQty(st.st)}</b> <small class="mut">${esc(it.unidad)}</small>${st.camino ? `<br><small class="chip info" title="Solicitado y aún sin recibir">+${fmtQty(st.camino)} en camino</small>` : ''}</td>
     ${ins ? `<td class="r">${fmtQty(un.sellado)}</td><td class="r">${fmtQty(un.uso)}</td>` : ''}<td class="r">${st.min || '—'}${it.min > 0 ? '' : st.min ? ' <small class="mut" title="Mínimo calculado según consumo">auto</small>' : ''}</td>
-    <td class="r">${fmtN(st.u.perDay, st.u.perDay < 1 ? 2 : 1)}${origen(st.u)}</td><td class="r">${st.cov === null ? '—' : fmtN(st.cov, 1) + ' d'}</td><td>${statusChip(st)}</td>
+    <td class="r">${fmtN(st.u.perDay, st.u.perDay < 1 ? 2 : 1)}${origen(st.u)}</td><td class="r">${st.cov === null ? '—' : fmtN(st.cov, 1) + ' d'}</td><td>${statusChip(st)}</td>${hasExp ? `<td>${ex ? expChip(ex.e, ex.l) : '<span class="mut">—</span>'}</td>` : ''}
     ${costos ? `<td class="r">${it.costo ? fmtN(it.costo, 2) : '—'}</td>${S.invTab === 'producto' ? `<td class="r">${it.precio ? fmtN(it.precio, 2) : '—'}</td>` : ''}<td class="r">${it.costo ? fmtN(Math.max(0, st.st) * it.costo, 2) : '—'}</td>` : ''}
     <td><div class="act">${can('mov') ? `<button class="btn sm icon-btn" title="Registrar ingreso" data-act="movFor" data-id="${it.id}" data-d="in">${ic('plus')}</button>${ins ? `<button class="btn sm" title="Pasar una unidad de Sellado a En uso" data-act="unitOpen" data-id="${it.id}">Abrir</button><button class="btn sm" title="Dar una unidad por terminada (sale del inventario)" data-act="unitDone" data-id="${it.id}">Terminar</button>` : ''}<button class="btn sm icon-btn" title="Registrar egreso" data-act="movFor" data-id="${it.id}" data-d="out" style="font-weight:900">−</button>` : ''}<button class="btn sm icon-btn" title="Historial y tiempo de uso" data-act="kardex" data-id="${it.id}">${ic('clock')}</button>${can('catalogo') ? `<button class="btn sm icon-btn" title="Editar" data-act="editItem" data-id="${it.id}">${ic('edit')}</button>` : ''}</div></td></tr>`; }).join('');
-  return `<div class="tw"><table><thead><tr><th>Código</th><th>Artículo</th><th class="r">Existencia</th>${ins ? '<th class="r" title="Unidades nuevas, sin abrir">Sellado</th><th class="r" title="Unidades abiertas, en uso">En uso</th>' : ''}<th class="r">Mínimo</th><th class="r">Consumo/día</th><th class="r">Cobertura</th><th>Estado</th>${costos ? `<th class="r">Costo</th>${S.invTab === 'producto' ? '<th class="r">Precio</th>' : ''}<th class="r">Valor</th>` : ''}<th></th></tr></thead><tbody>${body}</tbody></table></div>`;
+  return `<div class="tw"><table><thead><tr><th>Código</th><th>Artículo</th><th class="r">Existencia</th>${ins ? '<th class="r" title="Unidades nuevas, sin abrir">Sellado</th><th class="r" title="Unidades abiertas, en uso">En uso</th>' : ''}<th class="r">Mínimo</th><th class="r">Consumo/día</th><th class="r">Cobertura</th><th>Estado</th>${hasExp ? '<th title="Lote con existencia que vence primero">Vencimiento</th>' : ''}${costos ? `<th class="r">Costo</th>${S.invTab === 'producto' ? '<th class="r">Precio</th>' : ''}<th class="r">Valor</th>` : ''}<th></th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 PAGES.inventario = {
   title: 'Inventario',
@@ -121,7 +156,7 @@ PAGES.inventario = {
     return `<div class="tabs"><button data-act="invtab" data-t="producto" class="${S.invTab === 'producto' ? 'on' : ''}">Productos para venta (${n('producto')})</button><button data-act="invtab" data-t="insumo" class="${S.invTab === 'insumo' ? 'on' : ''}">Insumos (${n('insumo')})</button></div>
     <div class="tools"><input class="search" id="invq" placeholder="Buscar por nombre o código…" value="${esc(S.invQ)}" data-input="invq">
       <select data-change="invcat">${catOptions(S.invCat, S.invTab).replace('— Sin categoría —', 'Todas las categorías')}</select>
-      <select data-change="invest"><option value="">Todos los estados</option>${['OK', 'Por agotarse', 'Bajo mínimo', 'Agotado', 'Sin movimiento'].map(e => `<option ${S.invEst === e ? 'selected' : ''}>${e}</option>`).join('')}</select>
+      <select data-change="invest"><option value="">Todos los estados</option>${['OK', 'Por agotarse', 'Bajo mínimo', 'Agotado', 'Sin movimiento', 'Por vencer'].map(e => `<option ${S.invEst === e ? 'selected' : ''}>${e}</option>`).join('')}</select>
       <label style="display:flex;gap:6px;align-items:center;margin:0;font-weight:500"><input type="checkbox" style="width:auto" ${S.invArch ? 'checked' : ''} data-change="invarch"> archivados</label>
       <span class="sp"></span>${expBtns('inv')}${can('catalogo') ? `<button class="btn pri" data-act="newItem">${ic('plus')} Nuevo artículo</button>` : ''}</div>
     <div id="invtable">${invTable()}</div>`;
