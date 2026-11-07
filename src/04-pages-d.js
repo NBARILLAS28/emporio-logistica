@@ -9,7 +9,7 @@ function openUnit(kind, id) {
     title: `${abrir ? 'Abrir unidad' : 'Terminar unidad'} · ${esc(it.nombre)}`,
     body: `<form id="unitform" data-submit="unit" data-kind="${kind}" data-id="${id}">
       <div class="note">${abrir ? 'Pasa unidades de <b>Sellado</b> a <b>En uso</b>. Desde ese día se mide cuánto dura.' : 'Da por <b>terminadas</b> unidades que estaban en uso. Salen del inventario y se calcula cuántos días duraron.'}<br>
-      Ahora: <b>${fmtQty(un.sellado)}</b> sellado · <b>${fmtQty(un.uso)}</b> en uso · existencia real <b>${fmtQty(un.st)}</b> ${esc(it.unidad)}</div>
+      Ahora: <b>${fmtQty(un.sellado)}</b> sellado · <b>${fmtQty(un.uso)}</b> en uso · existencia real <b>${fmtQty(un.st)}</b> ${esc(it.unidad)}${can('ajuste') ? `<br><small>¿No coincide con lo que hay? <a href="#" data-act="unitFix" data-id="${id}">Corregir sellado / en uso</a></small>` : ''}</div>
       <div class="grid g3"><div class="fld"><label>Cantidad *</label><input name="cant" type="number" min="0" step="any" value="1" required></div>
        <div class="fld"><label>Fecha *</label><input type="date" name="fecha" value="${today()}" max="${today()}" required></div>
        <div class="fld"><label>Turno</label><select name="turno"><option value="AM" ${nowHM() < '14:00' ? 'selected' : ''}>${esc(cfg().turnoAM)}</option><option value="PM" ${nowHM() < '14:00' ? '' : 'selected'}>${esc(cfg().turnoPM)}</option></select></div></div>
@@ -17,6 +17,40 @@ function openUnit(kind, id) {
       <div class="mf" style="padding:8px 0 0;border:0"><button type="button" class="btn" data-act="mclose">Cancelar</button><button class="btn pri">${abrir ? 'Abrir' : 'Terminar'}</button></div></form>`,
   });
 }
+/* Corregir unidades: el usuario dice cuántas hay realmente selladas y en uso; el sistema hace los ajustes necesarios */
+ACT.unitFix = el => {
+  const id = el.dataset.id, it = itemById(id), un = unitState(id); if (!it) return;
+  openModal({
+    title: `Corregir sellado / en uso · ${esc(it.nombre)}`,
+    body: `<form id="unitfix" data-submit="unitfix" data-id="${id}">
+      <div class="note mb">Ahora el sistema dice: <b>${fmtQty(un.sellado)}</b> sellado (en bodega) · <b>${fmtQty(un.uso)}</b> en uso · existencia <b>${fmtQty(un.st)}</b> ${esc(it.unidad)}.<br><small>Escribe lo que hay <b>realmente</b>. El sistema ajusta la existencia y las unidades en uso por ti, y deja el movimiento anotado.</small></div>
+      <div class="grid g3"><div class="fld"><label>Sellado (en bodega) *</label><input name="sellado" data-input="unitfix" type="number" min="0" step="any" value="${un.sellado}" required></div>
+       <div class="fld"><label>En uso *</label><input name="uso" data-input="unitfix" type="number" min="0" step="any" value="${un.uso}" required></div>
+       <div class="fld"><label>Existencia total</label><input id="uf-total" value="${fmtQty(un.st)}" readonly></div></div>
+      <div class="fld"><label>Motivo (opcional)</label><input name="nota" maxlength="120" placeholder="Ej. Conteo físico: había 2 en uso y 1 en bodega"></div>
+      <div class="mf" style="padding:8px 0 0;border:0"><button type="button" class="btn" data-act="mclose">Cancelar</button><button class="btn pri">Corregir</button></div></form>`,
+  });
+};
+INP.unitfix = el => { const f = el.form; $('#uf-total').value = fmtQty(num(f.elements.sellado.value) + num(f.elements.uso.value)); };
+SUB.unitfix = async f => {
+  const id = f.dataset.id, it = itemById(id), s = num(f.elements.sellado.value), u = num(f.elements.uso.value), nota = f.elements.nota.value.trim();
+  if (!(s >= 0) || !(u >= 0) || s > 100000 || u > 100000) return toast('Escribe cantidades válidas (0 o más).', 'bad');
+  const cur = unitState(id), T = s + u, dif = T - cur.st;
+  if (!dif && u === cur.uso) { closeModal(); return toast('Ya estaba así, no hay nada que corregir.'); }
+  const turno = nowHM() < '14:00' ? 'AM' : 'PM', fecha = today(), txt = `Corrección de unidades: sistema ${fmtQty(cur.sellado)} sellado / ${fmtQty(cur.uso)} en uso, real ${fmtQty(s)} / ${fmtQty(u)}${nota ? '. ' + nota : ''}`;
+  if (dif) put('movements', mkMove({ itemId: id, dir: dif > 0 ? 'in' : 'out', tipo: dif > 0 ? 'ajuste_mas' : 'ajuste_menos', cant: Math.abs(dif), fecha, hora: nowHM(), turno, src: 'conteo', costoU: it.costo, nota: txt }));
+  const un = unitState(id), delta = u - (un.opened - un.done);   // unidades abiertas que faltan (+) o sobran (−)
+  if (delta > 0) put('movements', mkMove({ itemId: id, dir: 'ev', tipo: 'abrir', cant: delta, fecha, hora: '09:00', turno, src: 'abrir', nota: 'Corrección de unidades' }));
+  else if (delta < 0) {
+    let rem = -delta;
+    for (const e of (ix().evs.get(id) || []).filter(x => x.tipo === 'abrir').reverse()) {   // se quitan primero las aperturas más recientes
+      if (rem <= 0) break; const take = Math.min(e.cant, rem); rem -= take;
+      if (take >= e.cant) del('movements', e.id); else put('movements', { ...e, cant: e.cant - take });
+    }
+  }
+  log('Corregir unidades', `${it.nombre}: ${fmtQty(cur.sellado)}/${fmtQty(cur.uso)} → ${fmtQty(s)}/${fmtQty(u)} (sellado/en uso)`);
+  toast('Unidades corregidas', 'ok'); closeModal(); render();
+};
 ACT.unitOpen = el => openUnit('open', el.dataset.id);
 ACT.unitDone = el => openUnit('done', el.dataset.id);
 SUB.unit = async f => {
